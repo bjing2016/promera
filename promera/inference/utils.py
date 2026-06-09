@@ -549,8 +549,6 @@ def run_lmpnn_redesign(
         verbose=0,
         fasta_seq_separation=":",
         force_hetatm=0,
-        # Side-chain packing (disabled). Checkpoints listed for upstream's defaults
-        # but never loaded since pack_side_chains=0.
         pack_side_chains=0,
         pack_with_ligand_context=1,
         repack_everything=0,
@@ -574,7 +572,6 @@ def run_lmpnn_redesign(
         print(f"[lmpnn] no output FASTA at {fasta_path}")
         return []
 
-    # Skip the first parsed sequence: LigandMPNN echoes the input chain sequence first.
     seqs = []
     with open(fasta_path) as fh:
         for line in fh:
