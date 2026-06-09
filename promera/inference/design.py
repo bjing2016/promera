@@ -6,7 +6,7 @@ Given a target schema (.json), generate a binder by:
   2. (Optional) Flagging epitope or paratope residues via feats["is_epitope"].
   3. Running the cofolding pass (pairformer → diffusion → confidence).
   4. (Optional) Inverse-folding the binder backbone with LigandMPNN /
-     ProteinMPNN / SolubleMPNN and re-folding each redesigned sequence.
+     ProteinMPNN / SolubleMPNN / AbMPNN and re-folding each redesigned sequence.
 
 Run:
     python -m promera \\

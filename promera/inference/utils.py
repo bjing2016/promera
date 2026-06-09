@@ -7,7 +7,6 @@ import torch
 from scipy.special import softmax
 from tinyprot.structure import Structure
 
-
 def tm_function(d, Nres):
     d0 = 1.24 * (max(Nres, 19) - 15) ** (1 / 3) - 1.8
     return 1 / (1 + (d / d0) ** 2)
