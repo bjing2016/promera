@@ -18,9 +18,14 @@ Promera is built upon [tinyprot](https://github.com/bjing2016/tinyprot), a light
 
 ## Installation
 
-1. Install the packages and dependencies. 
+1. Install the packages and dependencies.
 ```bash
 pip install git+https://github.com/bjing2016/promera.git
+```
+For development, you can clone the repo and use [uv](https://docs.astral.sh/uv/) for a pinned and reproducible environment:
+```bash
+git clone https://github.com/bjing2016/promera.git && cd promera
+uv sync
 ```
 
 2. Follow the initialization instructions in [tinyprot](https://github.com/bjing2016/tinyprot).
