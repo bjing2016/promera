@@ -36,4 +36,4 @@ build-backend = "setuptools.build_meta"
 include = ["promera*"]
 
 [tool.setuptools.package-data]
-mypkg = ["*.yaml", "configs/*.yaml"]
+"*" = ["*.yaml"]
