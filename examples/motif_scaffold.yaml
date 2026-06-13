@@ -1,0 +1,48 @@
+output: ./out    # directory for outputs (created if absent)
+msa_dir:         # leave empty: the designed chain is novel and runs MSA-free
+
+# Reference structure (mmCIF only) supplying the motif sequence + Cα geometry.
+reference: examples/templates/7eow.cif
+motif_chain: B
+# Motif residue ranges in the reference's own numbering. "start-end" inclusive,
+# or a bare residue number. Multiple ranges = multiple segments.
+motif_ranges: ["33-40"]
+
+# Single chain that gets designed (must not collide with anything; it's the only chain).
+design_chain: A
+
+# Scaffold layout. Each field is an int (fixed) or [min, max] (sampled per backbone).
+scaffold:
+  n_term: [10, 20]   # X residues before the first motif segment
+  c_term: [10, 20]   # X residues after the last motif segment
+  linker: [4, 8]     # X residues between consecutive motif segments
+
+# Soft conditioning (no model changes):
+condition_motif: true   # feed intra-motif Cα distances into the trunk via distogram_emb
+motif_is_epitope: true  # flag motif tokens so the trunk attends to them
+
+# Cofolding inference. Each item produces one backbone via 1 trunk + 1 diffusion sample.
+recycling_steps: 4
+num_backbones: 100      # increase for a real screen (Design uses 10000)
+diffusion_steps: 200
+skip_existing: true
+save_traj: false
+save_distogram: false
+save_full_confidence: false
+
+# Sequence redesign of scaffold (X) positions only -- motif sequence stays fixed.
+inverse_folder:
+  type: solublempnn    # proteinmpnn | solublempnn | ligandmpnn | abmpnn | none
+  num_seqs: 1          # sequences per backbone
+
+# Diffusion schedule.
+diffusion:
+  sigma_min: 0.0004
+  sigma_max: 160.0
+  sigma_data: 16.0
+  rho: 7
+  gamma_0: 0.8
+  gamma_min: 1.0
+  noise_scale: 1.003
+  step_scale: 1.0
+  edm_churn: true
