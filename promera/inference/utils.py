@@ -1,11 +1,19 @@
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from scipy.special import softmax
 from tinyprot.structure import Structure
+
+
+def _log(msg):
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
 
 def tm_function(d, Nres):
     d0 = 1.24 * (max(Nres, 19) - 15) ** (1 / 3) - 1.8

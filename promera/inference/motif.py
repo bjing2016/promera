@@ -38,6 +38,7 @@ from .design import _inverse_fold, _sample_dir
 from .utils import (
     _AA3TO1,
     _copy_sample_to_struct,
+    _log,
     ca_distogram,
     compute_agg_confidence,
     compute_contact_stats,
@@ -46,13 +47,6 @@ from .utils import (
     refold_with_seq,
     save_samples,
 )
-
-
-def _log(msg):
-    import torch.distributed as dist
-
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
 
 
 def _sample_len(spec, rng):

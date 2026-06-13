@@ -34,6 +34,7 @@ from promera.data.utils import collate
 from .utils import (
     _AA3TO1,
     _copy_sample_to_struct,
+    _log,
     _resolve_residue_idx,
     _struct_to_pdb,
     ca_distogram,
@@ -57,12 +58,6 @@ _MPNN_VARIANTS = {
     "ligandmpnn": "ligand_mpnn",
     "abmpnn": "ab_mpnn"
 }
-
-def _log(msg):
-    import torch.distributed as dist
-
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
 
 
 def _build_binder_chain(binder_cfg, rng=None) -> dict:
