@@ -6,14 +6,7 @@ import json
 import os
 import time
 import torch
-from .utils import finalize_feats, compute_agg_confidence, compute_contact_stats
-
-
-def _log(msg):
-    import torch.distributed as dist
-
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
+from .utils import finalize_feats, compute_agg_confidence, compute_contact_stats, _log
 
 
 class Cofolding:

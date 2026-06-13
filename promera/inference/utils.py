@@ -1,11 +1,19 @@
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from scipy.special import softmax
 from tinyprot.structure import Structure
+
+
+def _log(msg):
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
 
 def tm_function(d, Nres):
     d0 = 1.24 * (max(Nres, 19) - 15) ** (1 / 3) - 1.8
@@ -703,3 +711,111 @@ def compute_target_lddt(template_chain, pred_struct, target_chain_id, epitope_po
         pred_chain = pred_chain.residue_slice(mask)
     result = _tp_lddt(template_chain, pred_chain)
     return float(result["LDDT"])
+
+
+def ca_distogram(template_coords, has_template):
+    """Build (distogram_emb, distogram_mask) from Cα template coords + a mask.
+
+    Bins match the model's training: np.linspace(1, 50, 50), bin index 0..50.
+    Only pairs where both positions are present (has_template) are conditioned.
+    """
+    diff = template_coords[:, None, :] - template_coords[None, :, :]
+    dists = np.sqrt((diff**2).sum(-1))
+    boundaries = np.linspace(1, 50, 50)
+    bin_idx = (dists[..., None] > boundaries).sum(-1).astype(np.int64)
+    pair_mask = has_template[:, None] & has_template[None, :]
+    distogram_emb = np.where(pair_mask, bin_idx, 0).astype(np.int64)
+    return distogram_emb, pair_mask
+
+
+def save_samples(struct_template, sample_coords, path_fn):
+    """Write each sample as CIF + PDB. path_fn(n) -> (cif_path, pdb_path).
+
+    Returns the list of written PDB paths.
+    """
+    import copy
+
+    pdb_paths = []
+    for n, samp in enumerate(sample_coords):
+        s = copy.deepcopy(struct_template)
+        _copy_sample_to_struct(s, samp)
+        cif_path, pdb_path = path_fn(n)
+        os.makedirs(os.path.dirname(cif_path), exist_ok=True)
+        s.to_mmcif(cif_path, metadata=True)
+        _struct_to_pdb(s, pdb_path)
+        pdb_paths.append(pdb_path)
+    return pdb_paths
+
+
+def refold_with_seq(
+    model, msa_dir, struct, design_chain, design_seq, recycling_steps, diff_cfg, device
+):
+    """Re-featurize a structure with a redesigned sequence on `design_chain` and
+    run pairformer + diffusion + confidence. Returns (struct_new, samples, agg_confs)."""
+    from tinyprot.feature import AF3Featurizer
+    from tinyprot.msa import construct_paired_msa, load_msa_from_dir
+
+    from promera.data.utils import collate
+
+    schema = struct.to_schema()
+    schema[design_chain] = {"type": "protein", "sequence": design_seq}
+    struct_new = Structure.from_schema(schema)
+
+    msas = load_msa_from_dir(msa_dir, struct_new.chains)
+    pairing = construct_paired_msa(msas)
+    feats = AF3Featurizer(struct_new, msas, pairing).featurize(compute_frames=True)
+    feats = finalize_feats(feats, struct_new, "refold", seed_idx=0)
+    batch = collate([feats])
+    batch = {
+        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+        for k, v in batch.items()
+    }
+
+    with torch.no_grad():
+        out = model.pairformer_forward(batch, recycling_steps=recycling_steps)
+        diff = model.sample_diffusion(batch, out, diff_cfg)
+
+    samples = diff["sample_atom_coords"].cpu().numpy()
+    agg_confs = []
+    if model.cfg.model.has_confidence:
+        coords = diff["sample_atom_coords"]
+        mul = diff_cfg.diffusion_samples
+        ntoks = int(batch["token_pad_mask"][0].sum())
+        for i in range(mul):
+            conf = model.sm_confidence_module(
+                batch,
+                out | {"sample_atom_coords": coords[i::mul]},
+                multiplicity=1,
+            )
+            pde = conf["pde"][0, :ntoks, :ntoks]
+            pae = conf["pae"][0, :ntoks, :ntoks]
+            plddt = conf["plddt"][0, :ntoks]
+            pae_logits = conf["pae_logits"][0, :ntoks, :ntoks]
+            frame_mask = batch["frames_mask"][0, :ntoks]
+            asym_id = batch["asym_id_"][0]
+            agg_conf = compute_agg_confidence(
+                pde=pde,
+                pae=pae,
+                plddt=plddt,
+                pae_logits=pae_logits,
+                asym_id=asym_id,
+                frame_mask=frame_mask,
+                use_torch=True,
+            )
+            torch.cuda.empty_cache()
+
+            if getattr(model.cfg.model, "has_contact_module", False):
+                contact_out = model.contact_module(
+                    batch,
+                    out | {"sample_atom_coords": coords[i::mul]},
+                    multiplicity=1,
+                )
+                agg_conf["contact_scores"] = compute_contact_stats(
+                    contact_out["contact_logits"][0, :ntoks, :ntoks].cpu(),
+                    contact_out["pred_dist"][0, :ntoks, :ntoks].cpu(),
+                    batch["asym_id_"][0][:ntoks],
+                )
+                torch.cuda.empty_cache()
+
+            agg_confs.append(agg_conf)
+    return struct_new, samples, agg_confs
