@@ -105,7 +105,40 @@ def _load_motif_segments(chain, ranges):
     return segments
 
 
-def _build_motif_schema(segments, scaffold_cfg, design_chain, rng):
+def _load_motif_segments_pdb(pdb_path, chain_id, ranges):
+    """Like _load_motif_segments but reads a .pdb via prody """
+    import prody
+
+    st = prody.parsePDB(pdb_path)
+    if st is None:
+        raise ValueError(f"could not parse {pdb_path}")
+    chain = st.getHierView()[chain_id]
+    if chain is None:
+        raise ValueError(f"chain {chain_id!r} not in {pdb_path}")
+    res_by_num = {res.getResnum(): res for res in chain.iterResidues()}
+
+    segments = []
+    for start, end in _parse_ranges(ranges):
+        seg = []
+        for resnum in range(start, end + 1):
+            res = res_by_num.get(resnum)
+            if res is None:
+                raise ValueError(
+                    f"motif residue {resnum} not found in chain {chain_id} of {pdb_path}"
+                )
+            one = _AA3TO1.get(res.getResname(), "X")
+            ca_atom = res.select("name CA")
+            ca = (
+                None
+                if ca_atom is None
+                else np.asarray(ca_atom.getCoords()[0], dtype=np.float32)
+            )
+            seg.append((one, ca))
+        segments.append(seg)
+    return segments
+
+
+def _build_motif_schema(segments, scaffold_cfg, design_chain, rng, total_length=None):
     """Build a single-chain schema with motif residues fixed and X scaffold.
 
     Returns (schema, motif_positions, motif_ca) where motif_positions are the
@@ -116,17 +149,25 @@ def _build_motif_schema(segments, scaffold_cfg, design_chain, rng):
     c_term = scaffold_cfg.get("c_term", [10, 20])
     linker = scaffold_cfg.get("linker", [4, 8])
 
-    seq = "X" * _sample_len(n_term, rng)
-    motif_positions = []
-    motif_ca = []
-    for si, seg in enumerate(segments):
-        if si > 0:
-            seq += "X" * _sample_len(linker, rng)
-        for one, ca in seg:
-            motif_positions.append(len(seq))
-            motif_ca.append(None if ca is None else ca.tolist())
-            seq += one
-    seq += "X" * _sample_len(c_term, rng)
+    for _ in range(1000):
+        seq = "X" * _sample_len(n_term, rng)
+        motif_positions = []
+        motif_ca = []
+        for si, seg in enumerate(segments):
+            if si > 0:
+                seq += "X" * _sample_len(linker, rng)
+            for one, ca in seg:
+                motif_positions.append(len(seq))
+                motif_ca.append(None if ca is None else ca.tolist())
+                seq += one
+        seq += "X" * _sample_len(c_term, rng)
+        if total_length is None or total_length[0] <= len(seq) <= total_length[1]:
+            break
+    else:
+        raise ValueError(
+            f"could not sample scaffold within total_length {list(total_length)} "
+            "after 1000 tries"
+        )
 
     schema = {design_chain: {"type": "protein", "sequence": seq}}
     return schema, motif_positions, motif_ca
@@ -173,18 +214,22 @@ class MotifScaffolding:
     def __init__(self, cfg):
         self.cfg = cfg
 
-        ref = Structure.from_mmcif(cfg.reference)
-        motif_chain_id = getattr(cfg, "motif_chain", "A")
-        if motif_chain_id not in ref.chains:
-            raise ValueError(
-                f"motif_chain {motif_chain_id!r} not in {cfg.reference}; "
-                f"available: {list(ref.chains)}"
-            )
-        self._segments = _load_motif_segments(
-            ref.chains[motif_chain_id], list(cfg.motif_ranges)
-        )
+        motif = cfg.design.motif
+        ref_path = motif.reference
+        motif_chain_id = getattr(motif, "motif_chain", "A")
+        ranges = list(motif.motif_ranges)
+        if ref_path.lower().endswith((".cif", ".mmcif")):
+            ref = Structure.from_mmcif(ref_path)
+            if motif_chain_id not in ref.chains:
+                raise ValueError(
+                    f"motif_chain {motif_chain_id!r} not in {ref_path}; "
+                    f"available: {list(ref.chains)}"
+                )
+            self._segments = _load_motif_segments(ref.chains[motif_chain_id], ranges)
+        else:
+            self._segments = _load_motif_segments_pdb(ref_path, motif_chain_id, ranges)
         self._name = getattr(cfg, "name", None) or os.path.splitext(
-            os.path.basename(cfg.reference)
+            os.path.basename(ref_path)
         )[0]
 
         savedir = cfg.output
@@ -207,9 +252,14 @@ class MotifScaffolding:
         b_idx = self.items[idx]
         rng = random.Random(b_idx)
 
+        design = cfg.design
         t0 = time.time()
         schema, motif_positions, motif_ca = _build_motif_schema(
-            self._segments, cfg.scaffold, cfg.design_chain, rng
+            self._segments,
+            design.scaffold,
+            design.chain,
+            rng,
+            total_length=design.get("total_length", None),
         )
         struct = Structure.from_schema(schema)
 
@@ -220,23 +270,20 @@ class MotifScaffolding:
         feats["backbone_idx"] = b_idx
 
         n_tokens = len(feats["restype"])
-        if getattr(cfg, "condition_motif", True) and motif_positions:
+        if motif_positions:
             disto_emb, disto_mask = _compute_motif_distogram(
                 motif_positions, motif_ca, n_tokens
             )
             feats["distogram_emb"] = disto_emb
             feats["distogram_mask"] = disto_mask
-
-        if getattr(cfg, "motif_is_epitope", True) and motif_positions:
             feats["is_epitope"][motif_positions] = 1
-
 
         feats["motif_positions"] = motif_positions
         feats["motif_ca"] = motif_ca
 
         _log(
             f"__getitem__ {self._name} b{b_idx}: t={time.time()-t0:.2f}s  "
-            f"len={len(schema[cfg.design_chain]['sequence'])}  "
+            f"len={len(schema[design.chain]['sequence'])}  "
             f"motif_tokens={len(motif_positions)}"
         )
         return feats
@@ -250,7 +297,7 @@ class MotifScaffolding:
         b_idx = int(batch["backbone_idx"][0])
         struct = batch["struct"][0]
         device = batch["restype"].device
-        design_chain = cfg.design_chain
+        design_chain = cfg.design.chain
         motif_positions = list(batch["motif_positions"][0])
         motif_ca = batch["motif_ca"][0]
         design_seq = "".join(
