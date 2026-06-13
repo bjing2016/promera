@@ -136,6 +136,24 @@ Copy and edit [`examples/design_minibinder.yaml`](examples/design_minibinder.yam
 
 ---
 
+## Motif scaffolding
+
+Promera support motif scaffolding via the `promera.inference.MotifScaffolding` task. Given a reference structure and motif residue ranges it designs a single chain scaffold for the (potentially discontiguous) motif.
+
+1. Edit the motif spec in [`examples/motif_scaffold.yaml`](examples/motif_scaffold.yaml): point `design.motif.reference` at a struc, set `motif_chain`/`motif_ranges`, and the `scaffold` specifics.
+
+2. Run backbone diffusion + sequence redesign:
+
+```bash
+# motif scaffolding
+python -m promera \
+    --task promera.inference.MotifScaffolding \
+    --task_config examples/motif_scaffold.yaml \
+    output=out/
+```
+
+---
+
 ## License
 
 MIT. Other licenses may apply to third-party source code noted in comments / file headers.

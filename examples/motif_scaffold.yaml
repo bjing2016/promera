@@ -9,10 +9,10 @@ design:
     motif_chain: P                         # chain in the reference holding the motif
     motif_ranges: ["254-277"]              # reference numbering; multiple ranges = discontiguous motif
   scaffold:                                # X residues to infill (int = fixed, [min, max] = sampled per backbone)
-    n_term: [10, 40]                       # before the first motif segment
-    c_term: [10, 40]                       # after the last motif segment
+    n_term: [15, 45]                       # before the first motif segment
+    c_term: [15, 45]                       # after the last motif segment
     linker: [4, 8]                         # between consecutive motif segments
-  total_length: [50, 75]                   # resample scaffold lengths until total length is in range
+  total_length: [60, 100]                  # resample scaffold lengths until total length is in range
 
 # cofolding inference (one backbone via 1 trunk + 1 diffusion sample)
 recycling_steps: 4
