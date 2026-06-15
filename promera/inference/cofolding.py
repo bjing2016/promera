@@ -6,7 +6,12 @@ import json
 import os
 import time
 import torch
-from .utils import finalize_feats, compute_agg_confidence, compute_contact_stats
+from .utils import (
+    finalize_feats,
+    compute_agg_confidence,
+    compute_contact_stats,
+    msa_summary,
+)
 
 
 def _log(msg):
@@ -62,6 +67,10 @@ class Cofolding:
 
         pairing = construct_paired_msa(msas)
         feats = AF3Featurizer(struct, msas, pairing).featurize(compute_frames=True)
+
+        # Carry per-chain MSA depth/path on the struct (batch size is always 1,
+        # so this rides through to run_batch without a collated feature key).
+        struct.msa_summary = msa_summary(msas)
 
         _log(f"__getitem__ {name} seed{seed_idx}: {time.time()-t0:.2f}s")
 
@@ -204,6 +213,7 @@ class Cofolding:
                 )
 
             if conf_data:
+                conf_data.update(struct.msa_summary)
                 with open(
                     f"{savedir}/{name}/{name}_seed{seed_idx}_samp{n}_conf.json", "w"
                 ) as f:

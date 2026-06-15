@@ -173,6 +173,19 @@ def compute_contact_stats(contact_logits, pred_dist, asym_id):
     return chain_pair_stats
 
 
+def msa_summary(msas):
+    """Per-chain MSA depth (number of sequences) and source path.
+
+    `msas` maps chain_id -> tinyprot MSA. Dummy MSAs (no precomputed
+    alignment) report a depth of 1 (the query only) and a path of None.
+    Returns a dict with "msa_depth" and "msa_path" sub-dicts keyed by chain.
+    """
+    return {
+        "msa_depth": {cid: int(len(msa.seqs)) for cid, msa in msas.items()},
+        "msa_path": {cid: msa.path for cid, msa in msas.items()},
+    }
+
+
 def finalize_feats(feats, struct, name, seed_idx):
     feats["atom_pad_mask"] = np.ones_like(feats["ref_element"])
     feats["token_pad_mask"] = np.ones_like(feats["restype"])

@@ -43,6 +43,7 @@ from .utils import (
     compute_self_consistency_rmsd,
     compute_target_lddt,
     finalize_feats,
+    msa_summary,
     run_lmpnn_redesign,
 )
 
@@ -384,6 +385,7 @@ class Design:
         feats = AF3Featurizer(struct, msas, pairing).featurize(compute_frames=True)
         feats = finalize_feats(feats, struct, name, seed_idx=b_idx)
         feats["backbone_idx"] = b_idx
+        struct.msa_summary = msa_summary(msas)
 
         # finalize_feats zeros is_epitope; override after the call.
         epitope_idx = _resolve_epitope_idx(
@@ -483,10 +485,21 @@ class Design:
         struct_new = Structure.from_schema(schema)
         
         msas = load_msa_from_dir(self.cfg.msa_dir, struct_new.chains)
-        
+
+        # Refold non-binder chains with their real MSAs (use_msa: true).
+        for chain_id, chain in struct_new.chains.items():
+            if chain_id == design_chain:
+                continue
+            if "polypeptide" in chain.type and msas[chain_id].path is None:
+                raise ValueError(
+                    f"refold: non-binder chain {chain_id} has no MSA "
+                    "(use_msa: true required for non-binder chains)"
+                )
+
         pairing = construct_paired_msa(msas)
         feats = AF3Featurizer(struct_new, msas, pairing).featurize(compute_frames=True)
         feats = finalize_feats(feats, struct_new, "refold", seed_idx=0)
+        msa_info = msa_summary(msas)
         batch = collate([feats])
         batch = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -539,6 +552,7 @@ class Design:
                     )
                     torch.cuda.empty_cache()
 
+                agg_conf.update(msa_info)
                 agg_confs.append(agg_conf)
         return struct_new, samples, agg_confs
 
@@ -608,6 +622,7 @@ class Design:
             frame_mask=frame_mask,
             use_torch=True,
         )
+        agg_conf.update(struct.msa_summary)
         if cfg.save_full_confidence:
             np.savez(
                 f"{sample_dir}/backbone_confidence.npz",
