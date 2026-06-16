@@ -378,9 +378,18 @@ class Design:
             target_chains=cfg.target_chains or None,
             rng=rng,
         )
-        struct = Structure.from_schema(schema)        
+        struct = Structure.from_schema(schema)
         msas = load_msa_from_dir(cfg.msa_dir, struct.chains)
-        
+
+        # Design non-binder chains with their real MSAs (use_msa: true).
+        for chain_id, chain in struct.chains.items():
+            if chain_id == cfg.binder.chain:
+                continue
+            if "polypeptide" in chain.type and msas[chain_id].path is None:
+                raise ValueError(
+                    f"{name}: non-binder chain {chain_id} has no MSA"
+                )
+
         pairing = construct_paired_msa(msas)
         feats = AF3Featurizer(struct, msas, pairing).featurize(compute_frames=True)
         feats = finalize_feats(feats, struct, name, seed_idx=b_idx)
@@ -485,16 +494,6 @@ class Design:
         struct_new = Structure.from_schema(schema)
         
         msas = load_msa_from_dir(self.cfg.msa_dir, struct_new.chains)
-
-        # Refold non-binder chains with their real MSAs (use_msa: true).
-        for chain_id, chain in struct_new.chains.items():
-            if chain_id == design_chain:
-                continue
-            if "polypeptide" in chain.type and msas[chain_id].path is None:
-                raise ValueError(
-                    f"refold: non-binder chain {chain_id} has no MSA "
-                    "(use_msa: true required for non-binder chains)"
-                )
 
         pairing = construct_paired_msa(msas)
         feats = AF3Featurizer(struct_new, msas, pairing).featurize(compute_frames=True)
