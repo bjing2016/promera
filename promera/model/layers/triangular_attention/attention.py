@@ -130,7 +130,19 @@ class TriangleAttention(nn.Module):
 
         biases = [mask_bias, triangle_bias]
 
-        if chunk_size is not None:
+        # The cueq triangle-attention kernel is a fused flash-style kernel that
+        # wants the native batched layout (B, I, H, J, c) with a row-broadcast
+        # bias (B, 1, H, J, J). OpenFold's chunk_layer flattens the leading
+        # [B, I] dims together; at B == 1 the all-ones batch dims skip expansion
+        # so the broadcast survives, but at B > 1 it expands the broadcast row
+        # dim into B*I and corrupts the bias (it would feed cueq a bias of shape
+        # (B*I, H, J, J) instead of (B, 1, H, J, J)). Chunking is redundant for
+        # the cueq kernel anyway, so bypass it whenever there is a real batch
+        # dimension. The B == 1 path is left byte-identical to preserve the
+        # large-single-structure memory behaviour.
+        batched = x.shape[0] > 1
+
+        if chunk_size is not None and not batched:
             x = self._chunk(
                 x,
                 biases,

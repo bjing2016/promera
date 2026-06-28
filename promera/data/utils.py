@@ -106,7 +106,16 @@ def get_collate_to_crop_max(cfg):
     )
 
 
-def collate(data, max_tokens=None, max_atoms=None, max_seqs=None):
+def collate(data, max_tokens=None, max_atoms=None, max_seqs=None, token_multiple=1):
+    """Stack a list of feature dicts into one padded batch.
+
+    token_multiple: round the padded token count up to a multiple of this value
+    (default 1 = pad to the batch max). Set >1 to stabilize the token dimension
+    across batches so `torch.compile`d, token-dimensioned modules (the diffusion
+    token transformer) see a constant input shape and recompile far less often —
+    e.g. 32 collapses a narrow length spread (binder design) to a single compiled
+    shape. Atoms already round to a multiple of 32; the compiled module is
+    token-dimensioned, so only the token dim needs this."""
 
     if type(data[0]) is list:  # unpack lists
         data = [d for datum in data for d in datum]
@@ -128,22 +137,25 @@ def collate(data, max_tokens=None, max_atoms=None, max_seqs=None):
             continue
 
         if key in _msa_keys:
-            if max_seqs:
-                _pad_to_max(values, 0, pad_to=max_seqs)
-            _pad_to_max(values, 1, pad_to=max_tokens)
+            # Pad MSA depth (dim 0) to a common size so items with different
+            # numbers of aligned sequences can be stacked in one batch. With
+            # max_seqs unset this is the per-batch max depth; padded rows are
+            # masked out via msa_mask. Tokens (dim 1) pad to max_tokens / batch.
+            _pad_to_max(values, 0, pad_to=max_seqs)
+            _pad_to_max(values, 1, multiple_of=token_multiple, pad_to=max_tokens)
 
         elif key in _atom_keys:
             _pad_to_max(values, 0, multiple_of=32, pad_to=max_atoms)
 
         elif key in _token_pair_keys:
-            _pad_to_max(values, 0, pad_to=max_tokens)
-            _pad_to_max(values, 1, pad_to=max_tokens)
+            _pad_to_max(values, 0, multiple_of=token_multiple, pad_to=max_tokens)
+            _pad_to_max(values, 1, multiple_of=token_multiple, pad_to=max_tokens)
 
         elif key in _exclude_keys:
             pass
 
         else:
-            _pad_to_max(values, 0, pad_to=max_tokens)
+            _pad_to_max(values, 0, multiple_of=token_multiple, pad_to=max_tokens)
         values = np.stack(values)
         if values.dtype in float_types:
             values = values.astype(np.float32)

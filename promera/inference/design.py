@@ -44,7 +44,7 @@ from .utils import (
     compute_target_lddt,
     finalize_feats,
     msa_summary,
-    run_lmpnn_redesign,
+    run_lmpnn_redesign_batched,
 )
 
 _INPUT_EXT = ".json"
@@ -97,32 +97,27 @@ def _build_binder_chain(binder_cfg, rng=None) -> dict:
     raise ValueError(f"unknown binder.type: {btype}")
 
 
-def _inverse_fold(
-    pdb_path: str, binder_chain: str, ifold_cfg, binder_seq: str, lmpnn_dir: str
-) -> list:
-    """Run sequence redesign on the binder chain.
+def _inverse_fold_multi(structs, binder_chain, ifold_cfg, binder_seqs):
+    """Batched in-memory binder redesign over many backbones (no PDB I/O).
 
-    binder_seq is the resolved binder sequence (X marks positions to design).
-    Non-X positions are passed to LigandMPNN as fixed.
+    structs[i] is the backbone tinyprot Structure and binder_seqs[i] its resolved
+    binder sequence (X marks positions to design; non-X positions are fixed).
+    Returns a list aligned with structs, each a list of ifold_cfg.num_seqs
+    redesigned binder sequences.
     """
     ftype = ifold_cfg.type
     if ftype == "none":
-        return []
-    fixed = " ".join(
-        f"{binder_chain}{i+1}" for i, aa in enumerate(binder_seq) if aa != "X"
+        return [[] for _ in structs]
+    if ftype not in _MPNN_VARIANTS:
+        raise ValueError(f"unknown inverse_folder.type: {ftype}")
+    return run_lmpnn_redesign_batched(
+        structs,
+        binder_chain,
+        model_type=_MPNN_VARIANTS[ftype],
+        binder_seqs=binder_seqs,
+        num_seqs=ifold_cfg.num_seqs,
+        temperature=getattr(ifold_cfg, "temperature", 0.1),
     )
-    if ftype in _MPNN_VARIANTS:
-        return run_lmpnn_redesign(
-            pdb_path,
-            binder_chain,
-            lmpnn_dir,
-            num_seqs=ifold_cfg.num_seqs,
-            model_type=_MPNN_VARIANTS[ftype],
-            fixed_residues=fixed,
-        )
-    if ftype == "abmpnn":
-        raise NotImplementedError("abmpnn inverse folder — TODO")
-    raise ValueError(f"unknown inverse_folder.type: {ftype}")
 
 
 def _build_schema_for_input(
@@ -322,6 +317,30 @@ def _sample_dir(savedir: str, name: str, b_idx: int) -> str:
     return f"{savedir}/{name}/sample{b_idx}"
 
 
+def _to_fp32(x):
+    """Recursively cast floating tensors in a dict/list tree back to fp32.
+
+    The trunk runs under autocast (bf16) when amp is set, so its outputs must be
+    promoted before the fp32 diffusion path consumes them (s/z/s_inputs)."""
+    if torch.is_tensor(x):
+        return x.float() if x.is_floating_point() else x
+    if isinstance(x, dict):
+        return {k: _to_fp32(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_to_fp32(v) for v in x)
+    return x
+
+
+def _amp_context(amp):
+    """autocast context for cfg.amp ("bf16"/"fp16"), else a no-op."""
+    import contextlib
+
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp)
+    if amp_dtype is None:
+        return contextlib.nullcontext()
+    return torch.autocast("cuda", dtype=amp_dtype)
+
+
 class Design:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -485,191 +504,274 @@ class Design:
             pdb_paths.append(pdb_path)
         return pdb_paths
 
-    def _refold_with_seq(
-        self, model, struct, design_chain, design_seq, recycling_steps, diff_cfg, device
-    ):
-        """Re-featurize and run pairformer + diffusion + confidence with a redesigned sequence."""
-        schema = struct.to_schema()
-        schema[design_chain] = {"type": "protein", "sequence": design_seq}
-        struct_new = Structure.from_schema(schema)
-        
-        msas = load_msa_from_dir(self.cfg.msa_dir, struct_new.chains)
+    def _refold_batch(self, model, jobs, recycling_steps, diff_cfg, device):
+        """Re-featurize a list of redesigned binders and refold them as ONE batch.
 
-        pairing = construct_paired_msa(msas)
-        feats = AF3Featurizer(struct_new, msas, pairing).featurize(compute_frames=True)
-        feats = finalize_feats(feats, struct_new, "refold", seed_idx=0)
-        msa_info = msa_summary(msas)
-        batch = collate([feats])
+        jobs: list of (struct, design_chain, design_seq). The pairformer / diffusion
+        / confidence / contact passes run once over all jobs; diffusion emits
+        diff_cfg.diffusion_samples samples per job. Returns a list aligned with jobs
+        of (struct_new, samples[mul], agg_confs[mul])."""
+        struct_news, feats_list, msa_infos = [], [], []
+        for struct, design_chain, design_seq in jobs:
+            schema = struct.to_schema()
+            schema[design_chain] = {"type": "protein", "sequence": design_seq}
+            struct_new = Structure.from_schema(schema)
+            msas = load_msa_from_dir(self.cfg.msa_dir, struct_new.chains)
+            pairing = construct_paired_msa(msas)
+            feats = AF3Featurizer(struct_new, msas, pairing).featurize(compute_frames=True)
+            feats = finalize_feats(feats, struct_new, "refold", seed_idx=0)
+            struct_news.append(struct_new)
+            feats_list.append(feats)
+            msa_infos.append(msa_summary(msas))
+
+        batch = collate(feats_list)
         batch = {
             k: (v.to(device) if isinstance(v, torch.Tensor) else v)
             for k, v in batch.items()
         }
 
+        N = len(jobs)
+        mul = diff_cfg.diffusion_samples
+        amp_ctx = _amp_context(self.cfg.get("amp", None))
         with torch.no_grad():
-            out = model.pairformer_forward(batch, recycling_steps=recycling_steps)
+            with amp_ctx:
+                out = model.pairformer_forward(batch, recycling_steps=recycling_steps)
+            # Promote trunk outputs to fp32; diffusion re-autocasts via diff_cfg,
+            # confidence/contact via amp_ctx.
+            if self.cfg.get("amp", None) is not None:
+                out = _to_fp32(out)
             diff = model.sample_diffusion(batch, out, diff_cfg)
 
-        samples = diff["sample_atom_coords"].cpu().numpy()
-        agg_confs = []
-        if model.cfg.model.has_confidence:
-            coords = diff["sample_atom_coords"]
-            mul = diff_cfg.diffusion_samples
-            ntoks = int(batch["token_pad_mask"][0].sum())
-            for i in range(mul):
-                conf = model.sm_confidence_module(
-                    batch,
-                    out | {"sample_atom_coords": coords[i::mul]},
-                    multiplicity=1,
-                )
-                pde = conf["pde"][0, :ntoks, :ntoks]
-                pae = conf["pae"][0, :ntoks, :ntoks]
-                plddt = conf["plddt"][0, :ntoks]
-                pae_logits = conf["pae_logits"][0, :ntoks, :ntoks]
-                frame_mask = batch["frames_mask"][0, :ntoks]
-                asym_id = batch["asym_id_"][0]
-                agg_conf = compute_agg_confidence(
-                    pde=pde,
-                    pae=pae,
-                    plddt=plddt,
-                    pae_logits=pae_logits,
-                    asym_id=asym_id,
-                    frame_mask=frame_mask,
-                    use_torch=True,
-                )
-                torch.cuda.empty_cache()
+        # sample_atom_coords is laid out [N * mul] as job * mul + s.
+        all_samples = diff["sample_atom_coords"].float().cpu().numpy()
+        coords = diff["sample_atom_coords"]
 
-                if getattr(model.cfg.model, "has_contact_module", False):
-                    contact_out = model.contact_module(
+        # Per diffusion-sample confidence/contact across all jobs (coords[i::mul]
+        # selects sample i for every job, so [n] indexes job n).
+        confs_per_sample, contacts_per_sample = [], []
+        has_conf = model.cfg.model.has_confidence
+        has_contact = getattr(model.cfg.model, "has_contact_module", False)
+        if has_conf:
+            for i in range(mul):
+                with amp_ctx:
+                    conf = model.sm_confidence_module(
                         batch,
                         out | {"sample_atom_coords": coords[i::mul]},
                         multiplicity=1,
                     )
-                    agg_conf["contact_scores"] = compute_contact_stats(
-                        contact_out["contact_logits"][0, :ntoks, :ntoks].cpu(),
-                        contact_out["pred_dist"][0, :ntoks, :ntoks].cpu(),
-                        batch["asym_id_"][0][:ntoks],
+                conf = {
+                    k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
+                    for k, v in conf.items()
+                }
+                # Offload large logits to CPU (all `mul` samples are held at once).
+                conf["pae_logits"] = conf["pae_logits"].cpu()
+                if "pde_logits" in conf:
+                    conf["pde_logits"] = conf["pde_logits"].cpu()
+                confs_per_sample.append(conf)
+                if has_contact:
+                    with amp_ctx:
+                        contact_out = model.contact_module(
+                            batch,
+                            out | {"sample_atom_coords": coords[i::mul]},
+                            multiplicity=1,
+                        )
+                    contacts_per_sample.append(
+                        (
+                            contact_out["contact_logits"].float().cpu(),
+                            contact_out["pred_dist"].float().cpu(),
+                        )
                     )
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
-                agg_conf.update(msa_info)
+        results = []
+        for n in range(N):
+            samples = all_samples[n * mul : (n + 1) * mul]
+            ntoks = int(batch["token_pad_mask"][n].sum())
+            asym_id = batch["asym_id_"][n]
+            agg_confs = []
+            for i in range(len(confs_per_sample)):
+                conf = confs_per_sample[i]
+                pae = conf["pae"][n, :ntoks, :ntoks]
+                agg_conf = compute_agg_confidence(
+                    pde=conf["pde"][n, :ntoks, :ntoks],
+                    pae=pae,
+                    plddt=conf["plddt"][n, :ntoks],
+                    pae_logits=conf["pae_logits"][n, :ntoks, :ntoks].to(pae.device),
+                    asym_id=asym_id,
+                    frame_mask=batch["frames_mask"][n, :ntoks],
+                    use_torch=True,
+                )
+                if has_contact:
+                    contact_logits, pred_dist = contacts_per_sample[i]
+                    agg_conf["contact_scores"] = compute_contact_stats(
+                        contact_logits[n, :ntoks, :ntoks],
+                        pred_dist[n, :ntoks, :ntoks],
+                        batch["asym_id_"][n][:ntoks],
+                    )
+                agg_conf.update(msa_infos[n])
                 agg_confs.append(agg_conf)
-        return struct_new, samples, agg_confs
+            results.append((struct_news[n], samples, agg_confs))
+        return results
 
     def run_batch(self, model, batch):
         cfg = self.cfg
         savedir = cfg.output
-
-        name = batch["name"][0]
-        b_idx = int(batch["backbone_idx"][0])
-        struct = batch["struct"][0]
         device = batch["restype"].device
         binder_chain = cfg.binder.chain
-        binder_seq = "".join(
-            _AA3TO1.get(str(r), "X") for r in struct.chains[binder_chain].rname
-        )
-
-        sample_dir = _sample_dir(savedir, name, b_idx)
-        refold_dir = f"{sample_dir}/refolds"
-        os.makedirs(sample_dir, exist_ok=True)
 
         from types import SimpleNamespace
-        import tempfile
 
+        # Diffusion picks up mixed precision from these cfgs (model.sample_diffusion
+        # reads .amp_diffusion / .amp); the trunk/confidence passes below are wrapped
+        # in the matching autocast context explicitly.
+        amp = cfg.get("amp", None)
+        amp_diffusion = cfg.get("amp_diffusion", None)
+        amp_ctx = _amp_context(amp)
         backbone_diff_cfg = SimpleNamespace(
             diffusion=cfg.diffusion,
             diffusion_samples=1,
             diffusion_steps=cfg.diffusion_steps,
+            amp=amp,
+            amp_diffusion=amp_diffusion,
         )
         refold_diff_cfg = SimpleNamespace(
             diffusion=cfg.diffusion,
             diffusion_samples=5,
             diffusion_steps=cfg.diffusion_steps,
+            amp=amp,
+            amp_diffusion=amp_diffusion,
         )
+
+        # batch_size may be > 1: every element is an independent backbone. The
+        # backbone-generation GPU passes (pairformer / diffusion / confidence /
+        # contact) are fully batched over B; the per-element bookkeeping, IO,
+        # inverse folding and refold run in the write loop below.
+        B = len(batch["name"])
 
         t0 = time.time()
         if self._last_batch_end is not None:
-            _log(f"{name} b{b_idx}: idle={t0-self._last_batch_end:.2f}s")
+            _log(f"batch idle={t0-self._last_batch_end:.2f}s")
 
-        out = model.pairformer_forward(batch, recycling_steps=cfg.recycling_steps)
-        t1 = time.time()
-        diffusion_out = model.sample_diffusion(batch, out, backbone_diff_cfg)
-        t2 = time.time()
+        try:
+            with amp_ctx:
+                out = model.pairformer_forward(batch, recycling_steps=cfg.recycling_steps)
+            # Promote trunk outputs to fp32 between autocast regions; diffusion
+            # re-autocasts via backbone_diff_cfg, confidence/contact via amp_ctx.
+            if amp is not None:
+                out = _to_fp32(out)
+            t1 = time.time()
+            # diffusion_samples=1, so diffusion returns one sample per element,
+            # laid out [B] (element b at index b).
+            diffusion_out = model.sample_diffusion(batch, out, backbone_diff_cfg)
+            t2 = time.time()
 
-        all_samples = diffusion_out["sample_atom_coords"].cpu().numpy()
-        coords = diffusion_out["sample_atom_coords"]
+            all_samples = diffusion_out["sample_atom_coords"].float().cpu().numpy()
+            coords = diffusion_out["sample_atom_coords"]
 
-        agg_conf = None
+            with amp_ctx:
+                conf = model.sm_confidence_module(
+                    batch,
+                    out | {"sample_atom_coords": coords},
+                    multiplicity=1,
+                )
+            conf = {
+                k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
+                for k, v in conf.items()
+            }
+            # Offload the large [B, N, N, bins] logits to CPU; the per-element slice
+            # is moved back to the GPU where compute_agg_confidence runs.
+            conf["pae_logits"] = conf["pae_logits"].cpu()
+            if "pde_logits" in conf:
+                conf["pde_logits"] = conf["pde_logits"].cpu()
 
-        ntoks = int(batch["token_pad_mask"][0].sum())
-        conf = model.sm_confidence_module(
-            batch,
-            out | {"sample_atom_coords": coords},
-            multiplicity=1,
-        )
-        pde = conf["pde"][0, :ntoks, :ntoks]
-        pae = conf["pae"][0, :ntoks, :ntoks]
-        plddt = conf["plddt"][0, :ntoks]
-        pae_logits = conf["pae_logits"][0, :ntoks, :ntoks]
-        frame_mask = batch["frames_mask"][0, :ntoks]
-        asym_id = batch["asym_id_"][0]
-        agg_conf = compute_agg_confidence(
-            pde=pde,
-            pae=pae,
-            plddt=plddt,
-            pae_logits=pae_logits,
-            asym_id=asym_id,
-            frame_mask=frame_mask,
-            use_torch=True,
-        )
-        agg_conf.update(struct.msa_summary)
-        if cfg.save_full_confidence:
-            np.savez(
-                f"{sample_dir}/backbone_confidence.npz",
-                pde=pde.cpu().numpy(),
-                pae=pae.cpu().numpy(),
-                plddt=plddt.cpu().numpy(),
-                frame_mask=frame_mask.cpu().numpy(),
-                asym_id=asym_id,
-            )
-        torch.cuda.empty_cache()
-
-        if getattr(model.cfg.model, "has_contact_module", False):
-            contact_out = model.contact_module(
-                batch,
-                out | {"sample_atom_coords": coords},
-                multiplicity=1,
-            )
-            agg_conf["contact_score"] = compute_contact_stats(
-                contact_out["contact_logits"][0, :ntoks, :ntoks].cpu(),
-                contact_out["pred_dist"][0, :ntoks, :ntoks].cpu(),
-                batch["asym_id_"][0][:ntoks],
-            )
+            has_contact = getattr(model.cfg.model, "has_contact_module", False)
+            if has_contact:
+                with amp_ctx:
+                    contact_out = model.contact_module(
+                        batch,
+                        out | {"sample_atom_coords": coords},
+                        multiplicity=1,
+                    )
+                contact_logits = contact_out["contact_logits"].float().cpu()
+                pred_dist = contact_out["pred_dist"].float().cpu()
             torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            names = ", ".join(str(batch["name"][b]) for b in range(B))
+            _log(f"OOM for batch [{names}], skipping")
+            return
 
-        with open(f"{sample_dir}/backbone_confidence.json", "w") as f:
-            f.write(json.dumps(agg_conf, indent=4))
+        _log(f"batch ({B} backbone(s)): pf={t1-t0:.2f}s diff={t2-t1:.2f}s")
 
-        bb_paths = self._save_samples(
-            struct,
-            all_samples,
-            lambda n: (f"{sample_dir}/backbone.cif", f"{sample_dir}/backbone.pdb"),
-        )
-        backbone_pdb = bb_paths[0]
+        # Phase 1: per-backbone confidence, save backbone, interface contacts.
+        # Accumulate per-backbone state so inverse folding and refold can run
+        # batched across all backbones afterward.
+        elems = []
+        for b in range(B):
+            name = batch["name"][b]
+            b_idx = int(batch["backbone_idx"][b])
+            struct = batch["struct"][b]
+            binder_seq = "".join(
+                _AA3TO1.get(str(r), "X") for r in struct.chains[binder_chain].rname
+            )
 
-        backbone_struct = copy.deepcopy(struct)
-        _copy_sample_to_struct(backbone_struct, all_samples[0])
-        if cfg.binder.type == "vhh" and cfg.binder.get("paratope_from_cdrs", False):
-            paratope_positions = [i for i, aa in enumerate(binder_seq) if aa == "X"]
-        else:
-            paratope_positions = []
-        epitope_chain = cfg.epitope_chain or None
-        epitope_positions = None
-        if epitope_chain and cfg.epitope_residues:
-            ridx = backbone_struct.chains[epitope_chain].ridx.tolist()
-            epitope_positions = [
-                ridx.index(r) for r in cfg.epitope_residues if r in ridx
-            ]
-        if agg_conf is not None:
+            sample_dir = _sample_dir(savedir, name, b_idx)
+            refold_dir = f"{sample_dir}/refolds"
+            os.makedirs(sample_dir, exist_ok=True)
+
+            ntoks = int(batch["token_pad_mask"][b].sum())
+            pde = conf["pde"][b, :ntoks, :ntoks]
+            pae = conf["pae"][b, :ntoks, :ntoks]
+            plddt = conf["plddt"][b, :ntoks]
+            pae_logits = conf["pae_logits"][b, :ntoks, :ntoks].to(device)
+            frame_mask = batch["frames_mask"][b, :ntoks]
+            asym_id = batch["asym_id_"][b]
+            agg_conf = compute_agg_confidence(
+                pde=pde,
+                pae=pae,
+                plddt=plddt,
+                pae_logits=pae_logits,
+                asym_id=asym_id,
+                frame_mask=frame_mask,
+                use_torch=True,
+            )
+            agg_conf.update(struct.msa_summary)
+            if cfg.save_full_confidence:
+                np.savez(
+                    f"{sample_dir}/backbone_confidence.npz",
+                    pde=pde.cpu().numpy(),
+                    pae=pae.cpu().numpy(),
+                    plddt=plddt.cpu().numpy(),
+                    frame_mask=frame_mask.cpu().numpy(),
+                    asym_id=asym_id,
+                )
+
+            if has_contact:
+                agg_conf["contact_score"] = compute_contact_stats(
+                    contact_logits[b, :ntoks, :ntoks],
+                    pred_dist[b, :ntoks, :ntoks],
+                    batch["asym_id_"][b][:ntoks],
+                )
+
+            self._save_samples(
+                struct,
+                all_samples[b : b + 1],
+                lambda n, _d=sample_dir: (f"{_d}/backbone.cif", f"{_d}/backbone.pdb"),
+            )
+
+            backbone_struct = copy.deepcopy(struct)
+            _copy_sample_to_struct(backbone_struct, all_samples[b])
+            if cfg.binder.type == "vhh" and cfg.binder.get("paratope_from_cdrs", False):
+                paratope_positions = [i for i, aa in enumerate(binder_seq) if aa == "X"]
+            else:
+                paratope_positions = []
+            epitope_chain = cfg.epitope_chain or None
+            epitope_positions = None
+            if epitope_chain and cfg.epitope_residues:
+                ridx = backbone_struct.chains[epitope_chain].ridx.tolist()
+                epitope_positions = [
+                    ridx.index(r) for r in cfg.epitope_residues if r in ridx
+                ]
             agg_conf["contact_stats"] = compute_interface_contacts(
                 backbone_struct,
                 binder_chain,
@@ -680,77 +782,119 @@ class Design:
             with open(f"{sample_dir}/backbone_confidence.json", "w") as f:
                 f.write(json.dumps(agg_conf, indent=4))
 
-        iptm_str = (
-            f" iptm={agg_conf['complex_iptm']:.3f}"
-            if agg_conf and "complex_iptm" in agg_conf
-            else ""
+            iptm_str = (
+                f" iptm={agg_conf['complex_iptm']:.3f}"
+                if "complex_iptm" in agg_conf
+                else ""
+            )
+            _log(f"{name} b{b_idx}:{iptm_str}")
+
+            elems.append(
+                {
+                    "name": name,
+                    "b_idx": b_idx,
+                    "struct": struct,
+                    "sample_dir": sample_dir,
+                    "refold_dir": refold_dir,
+                    "backbone_struct": backbone_struct,
+                    "binder_seq": binder_seq,
+                    "paratope_positions": paratope_positions,
+                    "epitope_chain": epitope_chain,
+                    "epitope_positions": epitope_positions,
+                }
+            )
+
+        if cfg.inverse_folder.type == "none":
+            _log(f"batch total={time.time()-t0:.2f}s")
+            self._last_batch_end = time.time()
+            return
+
+        # Phase 2: batched, in-memory inverse folding over all backbones — one
+        # cached-model pass directly on the backbone structs (no PDB round-trip).
+        # Then expand to one refold job per redesigned sequence.
+        t_if0 = time.time()
+        seqs_per_backbone = _inverse_fold_multi(
+            [e["backbone_struct"] for e in elems],
+            binder_chain,
+            cfg.inverse_folder,
+            [e["binder_seq"] for e in elems],
         )
-        _log(f"{name} b{b_idx}: pf={t1-t0:.2f}s diff={t2-t1:.2f}s{iptm_str}")
-
-        if cfg.inverse_folder.type != "none":
-            with tempfile.TemporaryDirectory() as ifold_dir:
-                redesigned_seqs = _inverse_fold(
-                    backbone_pdb,
-                    binder_chain,
-                    cfg.inverse_folder,
-                    binder_seq,
-                    ifold_dir,
-                )
-
-            for j, seq in enumerate(redesigned_seqs):
-                design_id = f"sample{b_idx}_design{j}"
-                with open(f"{sample_dir}/{design_id}.fasta", "w") as f:
+        jobs = []
+        for e, seqs in zip(elems, seqs_per_backbone):
+            for j, seq in enumerate(seqs):
+                design_id = f"sample{e['b_idx']}_design{j}"
+                with open(f"{e['sample_dir']}/{design_id}.fasta", "w") as f:
                     f.write(f">{design_id}\n{seq}\n")
+                jobs.append({"elem": e, "design_id": design_id, "seq": seq})
+        _log(f"inverse fold ({len(jobs)} design(s)): {time.time()-t_if0:.2f}s")
 
-                t_r0 = time.time()
-                struct_m, samples_m, refold_confs = self._refold_with_seq(
+        # Phase 3: batched refold of every design. Chunked to ~B designs per pass so
+        # the refold width tracks the backbone batch and memory stays bounded even
+        # when inverse_folder.num_seqs > 1.
+        t_rf0 = time.time()
+        refold_results = []
+        chunk = max(1, B)
+        for c0 in range(0, len(jobs), chunk):
+            chunk_jobs = jobs[c0 : c0 + chunk]
+            refold_results.extend(
+                self._refold_batch(
                     model,
-                    struct,
-                    binder_chain,
-                    seq,
+                    [(j["elem"]["struct"], binder_chain, j["seq"]) for j in chunk_jobs],
                     cfg.recycling_steps,
                     refold_diff_cfg,
                     device,
                 )
-                self._save_samples(
-                    struct_m,
-                    samples_m,
-                    lambda r, _id=design_id: (
-                        f"{refold_dir}/{_id}_refold{r}.cif",
-                        f"{refold_dir}/{_id}_refold{r}.pdb",
-                    ),
+            )
+        if jobs:
+            _log(f"refold ({len(jobs)} design(s)): {time.time()-t_rf0:.2f}s")
+
+        # Phase 4: per-design write + metrics (CPU).
+        for job, (struct_m, samples_m, refold_confs) in zip(jobs, refold_results):
+            e = job["elem"]
+            design_id = job["design_id"]
+            refold_dir = e["refold_dir"]
+            backbone_struct = e["backbone_struct"]
+            paratope_positions = e["paratope_positions"]
+            epitope_chain = e["epitope_chain"]
+            epitope_positions = e["epitope_positions"]
+
+            self._save_samples(
+                struct_m,
+                samples_m,
+                lambda r, _id=design_id, _d=refold_dir: (
+                    f"{_d}/{_id}_refold{r}.cif",
+                    f"{_d}/{_id}_refold{r}.pdb",
+                ),
+            )
+            for r, conf_r in enumerate(refold_confs):
+                refold_struct = copy.deepcopy(struct_m)
+                _copy_sample_to_struct(refold_struct, samples_m[r])
+                conf_r["contact_stats"] = compute_interface_contacts(
+                    refold_struct,
+                    binder_chain,
+                    paratope_positions,
+                    epitope_chain=epitope_chain,
+                    epitope_positions=epitope_positions,
                 )
-                for r, conf in enumerate(refold_confs):
-                    refold_struct = copy.deepcopy(struct_m)
-                    _copy_sample_to_struct(refold_struct, samples_m[r])
-                    conf["contact_stats"] = compute_interface_contacts(
+                conf_r["binder_scRMSD"] = compute_self_consistency_rmsd(
+                    backbone_struct,
+                    refold_struct,
+                    binder_chain,
+                )
+                conf_r["scDockQ"] = compute_dockq(backbone_struct, refold_struct)
+                if self._target_template_chain is not None:
+                    conf_r["target_template_lddt"] = compute_target_lddt(
+                        self._target_template_chain,
                         refold_struct,
-                        binder_chain,
-                        paratope_positions,
-                        epitope_chain=epitope_chain,
+                        self._target_template_chain_id,
                         epitope_positions=epitope_positions,
                     )
-                    conf["binder_scRMSD"] = compute_self_consistency_rmsd(
-                        backbone_struct,
-                        refold_struct,
-                        binder_chain,
-                    )
-                    conf["scDockQ"] = compute_dockq(backbone_struct, refold_struct)
-                    if self._target_template_chain is not None:
-                        conf["target_template_lddt"] = compute_target_lddt(
-                            self._target_template_chain,
-                            refold_struct,
-                            self._target_template_chain_id,
-                            epitope_positions=epitope_positions,
-                        )
-                    with open(
-                        f"{refold_dir}/{design_id}_refold{r}_confidence.json", "w"
-                    ) as f:
-                        f.write(json.dumps(conf, indent=4))
-                best = max((c.get("complex_iptm", 0) for c in refold_confs), default=0)
-                _log(
-                    f"  {design_id}: refold={time.time()-t_r0:.2f}s best_iptm={best:.3f}"
-                )
+                with open(
+                    f"{refold_dir}/{design_id}_refold{r}_confidence.json", "w"
+                ) as f:
+                    f.write(json.dumps(conf_r, indent=4))
+            best = max((c.get("complex_iptm", 0) for c in refold_confs), default=0)
+            _log(f"  {design_id}: best_iptm={best:.3f}")
 
-        _log(f"{name} b{b_idx}: total_batch={time.time()-t0:.2f}s")
+        _log(f"batch total={time.time()-t0:.2f}s")
         self._last_batch_end = time.time()

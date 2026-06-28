@@ -14,16 +14,13 @@
 # limitations under the License.
 
 import math
-import numpy as np
 from scipy.stats import truncnorm
 import torch
 
-
-def _prod(nums):
-    out = 1
-    for n in nums:
-        out = out * n
-    return out
+# Standard deviation of a standard normal truncated to [-2, 2]. Equal to
+# scipy.stats.truncnorm.std(a=-2, b=2); computed once at import so the per-tensor
+# init below does not call into scipy on the hot path.
+_TRUNCNORM_STD = float(truncnorm.std(a=-2, b=2, loc=0, scale=1))
 
 
 def _calculate_fan(linear_weight_shape, fan="fan_in"):
@@ -42,17 +39,19 @@ def _calculate_fan(linear_weight_shape, fan="fan_in"):
 
 
 def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
-    shape = weights.shape
-    f = _calculate_fan(shape, fan)
+    # Truncated-normal init matching the original scipy implementation, but
+    # vectorized in torch. scipy.truncnorm.rvs generates samples on the CPU via
+    # numpy (and then copies them into the tensor) regardless of device, so for a
+    # ~470M-param model it cost ~35s of pure CPU sampling at construction time.
+    # torch.nn.init.trunc_normal_ is a single fused kernel that runs natively on
+    # whatever device the tensor lives on.
+    f = _calculate_fan(weights.shape, fan)
     scale = scale / max(1, f)
-    a = -2
-    b = 2
-    std = math.sqrt(scale) / truncnorm.std(a=a, b=b, loc=0, scale=1)
-    size = _prod(shape)
-    samples = truncnorm.rvs(a=a, b=b, loc=0, scale=std, size=size)
-    samples = np.reshape(samples, shape)
+    std = math.sqrt(scale) / _TRUNCNORM_STD
     with torch.no_grad():
-        weights.copy_(torch.tensor(samples, device=weights.device))
+        torch.nn.init.trunc_normal_(
+            weights, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std
+        )
 
 
 def lecun_normal_init_(weights):

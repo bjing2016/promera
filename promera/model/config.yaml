@@ -1,4 +1,12 @@
 set_float32_matmul_precision: high
+
+# When true, build the model on the meta device (no real allocation/init) and
+# fill every tensor directly from the checkpoint via an assign-load. This is the
+# fastest path to inference but REQUIRES the checkpoint to cover 100% of the
+# model's parameters and buffers — any tensor left on meta raises an error. Keep
+# false for model development / training from scratch, which needs real init.
+meta_init: false
+
 trainer:
     accelerator: gpu
     devices: 1
@@ -8,7 +16,6 @@ trainer:
     strategy: auto
 
 data:
-    batch: 1
     workers: 1
 
 feature:
@@ -75,6 +82,10 @@ model:
     structure_module_args:
         dims: ${model.dims}
         compile_score: false
+        # Replay the diffusion score model as a CUDA graph during inference to
+        # remove per-step kernel-launch overhead (big win for the launch/memory-
+        # bound diffusion rollout; numerically identical to eager). See cudagraph.py.
+        cudagraph_score: false
         diffusion:
             sigma_data: 16.0
         score_model_args:

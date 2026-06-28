@@ -77,10 +77,10 @@ De novo binder design is built into Promera via the `promera.inference.Design` t
 
 ### Setup: LigandMPNN
 
-Sequence redesign after backbone diffusion requires [LigandMPNN](https://github.com/dauparas/LigandMPNN).
+Sequence redesign after backbone diffusion requires LigandMPNN. Use the promera-compatible fork [`bjing2016/LigandMPNN`](https://github.com/bjing2016/LigandMPNN), which adds an in-memory, GPU-batched redesign entrypoint (`design_batched`) and caches the loaded model across calls — the design loop scores every backbone in a batch in one pass, with no per-backbone PDB round-trip or checkpoint reload.
 
 ```bash
-git clone https://github.com/dauparas/LigandMPNN ../LigandMPNN
+git clone https://github.com/bjing2016/LigandMPNN ../LigandMPNN
 cd ../LigandMPNN && bash get_model_params.sh ./model_params
 export LIGANDMPNN_DIR=$(pwd)
 ```
@@ -133,6 +133,30 @@ python -m promera \
 ```
 
 Copy and edit [`examples/design_minibinder.yaml`](examples/design_minibinder.yaml) or [`examples/design_vhh.yaml`](examples/design_vhh.yaml) for your design setting.
+
+---
+
+## Optimizing performance
+
+The defaults are conservative (fp32, one target at a time). The knobs below speed up inference substantially on a Hopper GPU (H100) and **preserve the prediction** (bf16 differs from fp32 by no more than the run-to-run spread across diffusion samples). The diffusion roll-out dominates runtime, so most of the speedup targets it.
+
+Recommended settings, in priority order — **(1) raise `batch_size` until the GPU saturates, (2) `amp=bf16`, (3) `compile_score` + `pad_tokens_to_multiple`**; skip `cudagraph_score`:
+
+```bash
+python -m promera input=schemas/ output=out/ \
+    batch_size=16 amp=bf16 \
+    model.structure_module_args.compile_score=true \
+    pad_tokens_to_multiple=32 \
+    meta_init=true          # skip init, load straight from the checkpoint
+```
+
+- **`batch_size=N`** — fold/design N items per forward pass; the main lever for GPU utilization (`batch_size=1` leaves an H100 idle). Items are padded to the batch's largest size, so `sort_by_size=true` (default) groups similar sizes; pick N to fit memory (an OOM batch is skipped with a warning, not a crash). Results are independent of `batch_size` up to normal nondeterminism.
+- **`amp=bf16`** — runs the GPU forward passes in bfloat16 (the single biggest lever). bf16 is stable here; **fp16 overflows — avoid it.** `amp_diffusion` overrides the diffusion precision only. Use this flag, **not** Lightning's `precision=bf16-mixed`: the diffusion sampler opts out of autocast unless `amp`/`amp_diffusion` is set, so a blanket Lightning autocast collides with it and crashes.
+- **`compile_score=true`** — `torch.compile`s the diffusion token transformer. It is keyed on tensor shape, so each new padded token count triggers a ~60 s recompile; pair it with **`pad_tokens_to_multiple=32`** to round padded sizes to a shared shape (compile once instead of per size). Worth it for a narrow size spread (e.g. binder design); for a broad screen, bucket sizes and set `TORCHINDUCTOR_CACHE_DIR` on a shared path.
+- **`cudagraph_score`** *(not recommended)* — only helps the launch-bound `batch_size=1` case and does nothing at saturation; prefer raising `batch_size`.
+- **`meta_init=true`** — builds the model on the `meta` device and loads weights directly from the checkpoint (fastest startup). Requires the checkpoint to cover 100% of parameters/buffers; keep `false` for training.
+
+For **design**, `batch_size` + `amp=bf16` is the recommendation — backbone generation, inverse folding (one in-memory LigandMPNN pass with a cached model, no PDB round-trip), and refold all batch across the backbones in a batch. `compile_score`/`cudagraph_score` aren't worth it; a large fraction of each design is CPU work (the scRMSD/DockQ/CIF metrics), so end-to-end gains are smaller than the per-phase GPU speedups.
 
 ---
 

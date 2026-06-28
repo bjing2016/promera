@@ -1,3 +1,5 @@
+import importlib
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -430,106 +432,56 @@ def _get_interface_indices(
             interface.append(i)
     return interface
 
-def run_lmpnn_redesign(
-    pdb_path, binder_chain, lmpnn_dir, num_seqs=8, model_type=None, fixed_residues=None
-):
-    """Run ProteinMPNN/SolubleMPNN/LigandMPNN/AbMPNN redesign on a binder+target PDB."""
-    os.makedirs(lmpnn_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(pdb_path))[0]
-    sanitized_pdb = os.path.join(lmpnn_dir, f"{base}_sanitized.pdb")
-    with open(pdb_path) as fin, open(sanitized_pdb, "w") as fout:
-        for line in fin:
-            if line.startswith(("ATOM  ", "HETATM")) and line[17:20] == "UNK":
-                line = line[:17] + "ALA" + line[20:]
-            fout.write(line)
-    pdb_path = sanitized_pdb
-
-    if model_type is None:
-        model_type = _detect_model_type(pdb_path)
-    
-    requested_model_type = str(model_type).lower().replace("-", "").replace("_", "")
-    is_ligand_mpnn = requested_model_type in {"ligandmpnn", "ligand"}
-    
-    atoms = _parse_pdb_atoms(pdb_path)
-
-    pdb_chains       = sorted(set(a["chain"] for a in atoms))
-    binder_fasta_idx = pdb_chains.index(binder_chain)
-
-    if fixed_residues is None:
-        interface_idx = _get_interface_indices(
-            pdb_path,
-            binder_chain,
-            cutoff=6.0,
-            non_protein_target=is_ligand_mpnn,
-        )
-        binder_resnums = sorted(
-            set(
-                a["resnum"]
-                for a in atoms
-                if a["chain"] == binder_chain and a["record"] == "ATOM"
-            )
-        )
-        fixed_tokens = " ".join(
-            f"{binder_chain}{binder_resnums[i]}" for i in interface_idx
-        )
-    else:
-        fixed_tokens = fixed_residues
-
+def _lmpnn_import():
+    """Import LigandMPNN's run.main from $LIGANDMPNN_DIR."""
     if _LMPNN_DIR not in sys.path:
         sys.path.insert(0, _LMPNN_DIR)
     try:
         from run import main as lmpnn_main
     except ImportError as e:
         raise ImportError(f"Could not import LigandMPNN from {_LMPNN_DIR}.\n{e}")
-    
+    return lmpnn_main
+
+
+def _lmpnn_resolve(model_type):
+    """Map an inverse-folder type to (lmpnn_model_type, checkpoint_protein_mpnn, mp)."""
+    requested = str(model_type).lower().replace("-", "").replace("_", "")
     mp = os.path.join(_LMPNN_DIR, "model_params")
     protein_mpnn_ckpt = os.path.join(mp, "proteinmpnn_v_48_020.pt")
-    soluble_mpnn_ckpt = os.path.join(mp, "solublempnn_v_48_020.pt")
-    ligand_mpnn_ckpt = os.path.join(mp, "ligandmpnn_v_32_010_25.pt")
-
-    abmpnn_ckpt = os.environ.get(
-        "ABMPNN_CHECKPOINT",
-        os.path.join(mp, "abmpnn.pt"),
-    )
-
-    if requested_model_type in {"proteinmpnn"}:
-        lmpnn_model_type = "protein_mpnn"
-        checkpoint_protein_mpnn = protein_mpnn_ckpt
-
-    elif requested_model_type in {"solublempnn"}:
-        lmpnn_model_type = "soluble_mpnn"
-        checkpoint_protein_mpnn = protein_mpnn_ckpt
-
-    elif requested_model_type in {"abmpnn"}:
-        lmpnn_model_type = "protein_mpnn"
-        checkpoint_protein_mpnn = abmpnn_ckpt
-
-        if not os.path.exists(checkpoint_protein_mpnn):
+    abmpnn_ckpt = os.environ.get("ABMPNN_CHECKPOINT", os.path.join(mp, "abmpnn.pt"))
+    if requested == "proteinmpnn":
+        return "protein_mpnn", protein_mpnn_ckpt, mp
+    if requested == "solublempnn":
+        return "soluble_mpnn", protein_mpnn_ckpt, mp
+    if requested == "abmpnn":
+        if not os.path.exists(abmpnn_ckpt):
             raise FileNotFoundError(
                 "AbMPNN checkpoint not found. Expected either:\n"
                 f"  {os.path.join(mp, 'abmpnn.pt')}\n"
-                "or set:\n"
-                "  export ABMPNN_CHECKPOINT=/path/to/abmpnn.pt"
+                "or set:\n  export ABMPNN_CHECKPOINT=/path/to/abmpnn.pt"
             )
+        return "protein_mpnn", abmpnn_ckpt, mp
+    if requested in {"ligandmpnn", "ligand"}:
+        return "ligand_mpnn", protein_mpnn_ckpt, mp
+    raise ValueError(
+        f"Unknown inverse_folder/model_type: {model_type!r}. "
+        "Expected one of: proteinmpnn, solublempnn, ligandmpnn, abmpnn."
+    )
 
-    elif requested_model_type in {"ligandmpnn"}:
-        lmpnn_model_type = "ligand_mpnn"
-        checkpoint_protein_mpnn = protein_mpnn_ckpt
 
-    else:
-        raise ValueError(
-            f"Unknown inverse_folder/model_type: {model_type!r}. "
-            "Expected one of: proteinmpnn, solublempnn, ligandmpnn, abmpnn."
-        )
+def _lmpnn_config(lmpnn_model_type, checkpoint_protein_mpnn, mp, lmpnn_dir, num_seqs, binder_chain):
+    """Build the full LigandMPNN run config with our defaults.
 
-    config = SimpleNamespace(
+    Caller sets the per-run pdb/fixed fields (single: pdb_path/fixed_residues;
+    batched: pdb_path_multi/fixed_residues_multi)."""
+    return SimpleNamespace(
         model_type=lmpnn_model_type,
         checkpoint_protein_mpnn=checkpoint_protein_mpnn,
-        checkpoint_ligand_mpnn=ligand_mpnn_ckpt,
-        checkpoint_soluble_mpnn=soluble_mpnn_ckpt,
-        pdb_path=pdb_path,
+        checkpoint_ligand_mpnn=os.path.join(mp, "ligandmpnn_v_32_010_25.pt"),
+        checkpoint_soluble_mpnn=os.path.join(mp, "solublempnn_v_48_020.pt"),
+        pdb_path="",
         pdb_path_multi="",
-        fixed_residues=fixed_tokens,
+        fixed_residues="",
         fixed_residues_multi="",
         redesigned_residues="",
         redesigned_residues_multi="",
@@ -577,14 +529,47 @@ def run_lmpnn_redesign(
             mp, "global_label_membrane_mpnn_v_48_020.pt"
         ),
     )
-    lmpnn_main(config)
 
-    base = os.path.splitext(os.path.basename(pdb_path))[0]
-    fasta_path = os.path.join(lmpnn_dir, "seqs", f"{base}.fa")
+
+def _sanitize_pdb(pdb_path, out_path):
+    """Copy a PDB to out_path, rewriting UNK residues to ALA (LigandMPNN rejects UNK)."""
+    with open(pdb_path) as fin, open(out_path, "w") as fout:
+        for line in fin:
+            if line.startswith(("ATOM  ", "HETATM")) and line[17:20] == "UNK":
+                line = line[:17] + "ALA" + line[20:]
+            fout.write(line)
+
+
+def _binder_fasta_idx(pdb_path, binder_chain):
+    """Column index of the binder chain in LigandMPNN's ':'-joined FASTA output."""
+    atoms = _parse_pdb_atoms(pdb_path)
+    pdb_chains = sorted(set(a["chain"] for a in atoms))
+    return pdb_chains.index(binder_chain)
+
+
+def _lmpnn_fixed_tokens(pdb_path, binder_chain, fixed_residues, is_ligand_mpnn):
+    """Fixed-residue token string for a backbone; autodetects the interface if None."""
+    if fixed_residues is not None:
+        return fixed_residues
+    atoms = _parse_pdb_atoms(pdb_path)
+    interface_idx = _get_interface_indices(
+        pdb_path, binder_chain, cutoff=6.0, non_protein_target=is_ligand_mpnn
+    )
+    binder_resnums = sorted(
+        set(
+            a["resnum"]
+            for a in atoms
+            if a["chain"] == binder_chain and a["record"] == "ATOM"
+        )
+    )
+    return " ".join(f"{binder_chain}{binder_resnums[i]}" for i in interface_idx)
+
+
+def _parse_lmpnn_seqs(fasta_path, binder_fasta_idx):
+    """Read redesigned binder-chain sequences from a LigandMPNN output FASTA."""
     if not os.path.exists(fasta_path):
         print(f"[lmpnn] no output FASTA at {fasta_path}")
         return []
-
     seqs = []
     with open(fasta_path) as fh:
         for line in fh:
@@ -594,6 +579,165 @@ def run_lmpnn_redesign(
                 if binder_fasta_idx < len(parts):
                     seqs.append(parts[binder_fasta_idx])
     return seqs[1:]
+
+
+def run_lmpnn_redesign(
+    pdb_path, binder_chain, lmpnn_dir, num_seqs=8, model_type=None, fixed_residues=None
+):
+    """Run ProteinMPNN/SolubleMPNN/LigandMPNN/AbMPNN redesign on a binder+target PDB."""
+    os.makedirs(lmpnn_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(pdb_path))[0]
+    sanitized_pdb = os.path.join(lmpnn_dir, f"{base}_sanitized.pdb")
+    _sanitize_pdb(pdb_path, sanitized_pdb)
+    pdb_path = sanitized_pdb
+
+    if model_type is None:
+        model_type = _detect_model_type(pdb_path)
+    is_ligand_mpnn = (
+        str(model_type).lower().replace("-", "").replace("_", "")
+        in {"ligandmpnn", "ligand"}
+    )
+
+    binder_fasta_idx = _binder_fasta_idx(pdb_path, binder_chain)
+    fixed_tokens = _lmpnn_fixed_tokens(pdb_path, binder_chain, fixed_residues, is_ligand_mpnn)
+
+    lmpnn_main = _lmpnn_import()
+    lmpnn_model_type, checkpoint_protein_mpnn, mp = _lmpnn_resolve(model_type)
+    config = _lmpnn_config(
+        lmpnn_model_type, checkpoint_protein_mpnn, mp, lmpnn_dir, num_seqs, binder_chain
+    )
+    config.pdb_path = pdb_path
+    config.fixed_residues = fixed_tokens
+    lmpnn_main(config)
+
+    base = os.path.splitext(os.path.basename(pdb_path))[0]
+    fasta_path = os.path.join(lmpnn_dir, "seqs", f"{base}.fa")
+    return _parse_lmpnn_seqs(fasta_path, binder_fasta_idx)
+
+
+def _struct_to_protein_dict(struct, device):
+    """Build a LigandMPNN parse_PDB-style protein_dict from a tinyprot Structure in
+    memory (no PDB round-trip). Returns (protein_dict, ordered_chain_ids).
+
+    Only protein chains are included; chain ids follow asym_id[0] (matching
+    _struct_to_pdb). X is [L,4,3] backbone N,CA,C,O; residues missing any backbone
+    atom are dropped (parse_PDB requires all four). Non-protein context (ligands,
+    nucleotides) is not carried, so ligand_mpnn runs without atom context here."""
+    if _LMPNN_DIR not in sys.path:
+        sys.path.insert(0, _LMPNN_DIR)
+    from data_utils import restype_str_to_int
+
+    Xs, Ss, ridxs, labels, letters, order = [], [], [], [], [], []
+    ci = 0
+    for asym_id, chain in struct.chains.items():
+        if not chain.type.startswith("polymer:polypeptide"):
+            continue
+        chain_id = asym_id[0] if asym_id else "A"
+        order.append(chain_id)
+        for i in range(len(chain.rname)):
+            coord = {}
+            for j, a in enumerate(chain.aname[i]):
+                a = str(a)
+                if a and bool(chain.mask[i, j]):
+                    coord[a] = chain.coords[i, j]
+            if not all(k in coord for k in ("N", "CA", "C", "O")):
+                continue
+            Xs.append(np.stack([coord["N"], coord["CA"], coord["C"], coord["O"]], 0))
+            aa1 = _AA3TO1.get(str(chain.rname[i])[:3], "X")
+            Ss.append(restype_str_to_int.get(aa1, restype_str_to_int["X"]))
+            ridxs.append(int(chain.ridx[i]))
+            labels.append(ci)
+            letters.append(chain_id)
+        ci += 1
+
+    L = len(Xs)
+    pd = {
+        "X": torch.tensor(np.stack(Xs, 0), dtype=torch.float32, device=device),
+        "S": torch.tensor(Ss, dtype=torch.int32, device=device),
+        "mask": torch.ones(L, dtype=torch.int32, device=device),
+        "R_idx": torch.tensor(ridxs, dtype=torch.int32, device=device),
+        "chain_labels": torch.tensor(labels, dtype=torch.int32, device=device),
+        "chain_letters": letters,
+        "mask_c": [
+            torch.tensor([cl == cid for cl in letters], dtype=torch.bool, device=device)
+            for cid in order
+        ],
+    }
+    return pd, order
+
+
+def run_lmpnn_redesign_batched(
+    structs, binder_chain, model_type, binder_seqs, num_seqs=1, temperature=0.1, device=None
+):
+    """In-memory, GPU-batched binder redesign over many backbones (no PDB I/O).
+
+    Builds LigandMPNN protein dicts directly from tinyprot structs and runs a single
+    cached model over the whole batch via ``run.design_batched`` — the MPNN model is
+    loaded once and reused across calls (see LIGANDMPNN_NO_CACHE), instead of being
+    rebuilt from the checkpoint on every backbone. Each backbone's non-X binder
+    positions are held fixed; ``num_seqs`` designs per backbone are produced by
+    replicating it in the batch (distinct per-element noise → distinct sequences).
+
+    Returns a list aligned with ``structs``, each a list of ``num_seqs`` redesigned
+    binder-chain sequences. Requires the promera-compatible LigandMPNN fork
+    (https://github.com/bjing2016/LigandMPNN) which provides ``design_batched``."""
+    if not structs:
+        return []
+    if _LMPNN_DIR not in sys.path:
+        sys.path.insert(0, _LMPNN_DIR)
+    try:
+        lmpnn_run = importlib.import_module("run")
+    except ImportError as e:
+        raise ImportError(f"Could not import LigandMPNN from {_LMPNN_DIR}.\n{e}")
+    if not hasattr(lmpnn_run, "design_batched"):
+        raise ImportError(
+            f"LigandMPNN at {_LMPNN_DIR} has no design_batched; use the "
+            "promera-compatible fork: https://github.com/bjing2016/LigandMPNN"
+        )
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    lmpnn_model_type, checkpoint_protein_mpnn, mp = _lmpnn_resolve(model_type)
+    cfg = SimpleNamespace(
+        model_type=lmpnn_model_type,
+        checkpoint_protein_mpnn=checkpoint_protein_mpnn,
+        checkpoint_soluble_mpnn=os.path.join(mp, "solublempnn_v_48_020.pt"),
+        checkpoint_ligand_mpnn=os.path.join(mp, "ligandmpnn_v_32_010_25.pt"),
+        ligand_mpnn_use_side_chain_context=0,
+        ligand_mpnn_use_atom_context=1,
+        ligand_mpnn_cutoff_for_score=8.0,
+        chains_to_design=binder_chain,
+        omit_AA="C",
+        temperature=temperature,
+        seed=0,
+        fasta_seq_separation=":",
+    )
+
+    n = max(1, int(num_seqs))
+    protein_dicts, orders, owner = [], [], []
+    for i, struct in enumerate(structs):
+        for _ in range(n):
+            pd, order = _struct_to_protein_dict(struct, device)
+            protein_dicts.append(pd)
+            orders.append(order)
+            owner.append(i)
+    fixed_list = [
+        " ".join(
+            f"{binder_chain}{k+1}"
+            for k, aa in enumerate(binder_seqs[owner[j]])
+            if aa != "X"
+        )
+        for j in range(len(owner))
+    ]
+    redes_list = [""] * len(protein_dicts)
+
+    raw = lmpnn_run.design_batched(cfg, protein_dicts, redes_list, fixed_list)
+
+    out = [[] for _ in structs]
+    for j, full_seq in enumerate(raw):
+        parts = full_seq.split(cfg.fasta_seq_separation)
+        out[owner[j]].append(parts[orders[j].index(binder_chain)])
+    return out
 
 from tinyprot.geometry import get_contact_mask, compute_rmsd
 from tinyprot.metrics import dockQ as _tp_dockq, LDDT as _tp_lddt

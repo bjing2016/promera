@@ -4,10 +4,32 @@
 from __future__ import annotations
 
 
+import types
+
 from einops import rearrange
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import Module
+
+
+def _make_layernorms_lowp(module):
+    """Patch every nn.LayerNorm in `module` to run in the active autocast dtype
+    (e.g. bf16) instead of being upcast to fp32 by autocast (which wraps each in
+    an fp32<->bf16 cast pair). F.layer_norm accumulates in fp32 internally, so
+    bf16 IO stays accurate; with autocast off it is byte-identical to before."""
+
+    def _lowp_layernorm_forward(self, x):
+        if torch.is_autocast_enabled() and x.dtype != torch.float32:
+            with torch.autocast("cuda", enabled=False):
+                w = self.weight.to(x.dtype) if self.weight is not None else None
+                b = self.bias.to(x.dtype) if self.bias is not None else None
+                return F.layer_norm(x, self.normalized_shape, w, b, self.eps)
+        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+
+    for m in module.modules():
+        if isinstance(m, nn.LayerNorm):
+            m.forward = types.MethodType(_lowp_layernorm_forward, m)
 
 from .layers import initialize as init
 from .loss.diffusion import (
@@ -187,10 +209,22 @@ class AtomDiffusion(Module):
         super().__init__()
         self.cfg = cfg
         self.score_model = DiffusionModule(**cfg.score_model_args, **cfg.dims)
-        if cfg.compile_score:
-            self.score_model = torch.compile(
-                self.score_model, dynamic=False, fullgraph=False
-            )
+        # Run the denoiser's LayerNorms in the autocast (bf16) dtype rather than
+        # letting autocast upcast them to fp32 and wrap every one in a cast pair.
+        # F.layer_norm accumulates in fp32 internally so bf16 IO stays accurate;
+        # the fp32 path is byte-identical. This removes the dominant cast overhead
+        # that otherwise caps bf16 diffusion throughput at saturation.
+        _make_layernorms_lowp(self.score_model)
+        # Whether to torch.compile the token transformer; done lazily on the first
+        # forward (see preconditioned_network_forward) so it happens AFTER the
+        # checkpoint is loaded — compiling here in __init__ renames the submodule's
+        # params (_orig_mod.*) and the checkpoint then fails to load into it.
+        self._compile_token_transformer = bool(cfg.compile_score)
+        self._tt_compiled = False
+        # Lazily-built CUDA-graph runner for the score model (inference only).
+        # Built on first forward (after weights are loaded) so score_model stays
+        # a normal submodule for checkpoint loading. See cudagraph.py.
+        self._cg_runner = None
 
     @property
     def device(self):
@@ -226,7 +260,41 @@ class AtomDiffusion(Module):
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
-        net_out = self.score_model(
+        # Lazily compile ONLY the token transformer (the 24-layer compute bulk of
+        # the denoiser, all standard ops) on the first inference forward, after the
+        # checkpoint is loaded. Compiling the *whole* score model is numerically
+        # unsafe: Inductor mis-lowers the conditioning/atom path (Fourier cos
+        # embedding + atom-encoder index gathers) and the small per-step error
+        # compounds over the ~200-step rollout into a broken structure (verified:
+        # whole-model compile -> LDDT ~0.07; token transformer only -> ~0.86). The
+        # token transformer alone fuses safely and yields ~2.2x diffusion at
+        # saturation.
+        if self._compile_token_transformer and not self._tt_compiled and not training:
+            self.score_model.token_transformer = torch.compile(
+                self.score_model.token_transformer, dynamic=False, fullgraph=False
+            )
+            self._tt_compiled = True
+
+        # CUDA-graph the score model during inference: the rollout calls it
+        # identically every step (only r_noisy/times change), so replaying a
+        # captured graph removes the per-step kernel-launch overhead that
+        # dominates the (memory/launch-bound) diffusion. Numerically identical to
+        # eager. Disabled during training and when alt updates are used.
+        use_cudagraph = (
+            bool(getattr(self.cfg, "cudagraph_score", False))
+            and not training
+            and not self.cfg.score_model_args.has_alt_update
+        )
+        if use_cudagraph:
+            if self._cg_runner is None:
+                from .cudagraph import CUDAGraphScoreModel
+
+                self._cg_runner = CUDAGraphScoreModel(self.score_model)
+            score_fn = self._cg_runner
+        else:
+            score_fn = self.score_model
+
+        net_out = score_fn(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
             times=self.c_noise(sigma),
             **network_condition_kwargs,
