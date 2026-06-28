@@ -117,11 +117,33 @@ class PromeraModel(LightningModuleTemplate):
     def subsample_msa(self, feats, subsample=None):
         subsample = subsample or self.cfg.model.msas_per_trunk_iter
         new = {**feats}
-        indices = np.random.choice(
-            np.arange(feats["msa"].shape[1]),
-            size=min(feats["msa"].shape[1], subsample),
-            replace=False,
-        )
+
+        msa = feats["msa"]
+        B, S = msa.shape[0], msa.shape[1]
+        k = min(S, subsample)
+
+        # With batch_size > 1, collate pads shallower MSAs up to the batch-max
+        # depth S with masked zero rows. Subsampling must therefore be done
+        # PER batch element over each item's own real rows -- a single shared
+        # index set drawn from arange(S) would spend most of a shallow item's
+        # quota on its padded (masked) rows, silently shrinking its effective
+        # MSA. Real rows are those with any unmasked position; collate appends
+        # padding at the end, and any leftover slots point at a padded (masked)
+        # row so they contribute nothing -- reproducing the bs=1 behaviour
+        # (each item keeps min(real_depth, subsample) real sequences) exactly.
+        row_real = feats["msa_mask"].any(dim=-1).cpu().numpy()  # [B, S] bool
+        idx = np.zeros((B, k), dtype=np.int64)
+        for b in range(B):
+            real = np.nonzero(row_real[b])[0]
+            if real.size == 0:
+                real = np.array([0])
+            kb = min(k, real.size)
+            idx[b, :kb] = np.random.choice(real, size=kb, replace=False)
+            if kb < k:
+                padded = np.nonzero(~row_real[b])[0]
+                idx[b, kb:] = padded[0] if padded.size else 0
+
+        idx_t = torch.from_numpy(idx).to(msa.device)
         for key in [
             "msa",
             "msa_mask",
@@ -129,9 +151,12 @@ class PromeraModel(LightningModuleTemplate):
             "deletion_value",
             "has_deletion",
         ]:
-            new[key] = feats[key][:, indices]
+            v = feats[key]
+            gather_idx = idx_t.view(B, k, *([1] * (v.dim() - 2))).expand(
+                B, k, *v.shape[2:]
+            )
             new[key] = torch.nn.functional.pad(
-                new[key], (0, 0, 0, subsample - len(indices))
+                torch.gather(v, 1, gather_idx), (0, 0, 0, subsample - k)
             )
 
         return new
@@ -454,8 +479,22 @@ class PromeraModel(LightningModuleTemplate):
 
         return loss
 
-    @torch.autocast("cuda", enabled=False)
     def sample_diffusion(self, batch, out, cfg):
+        # Diffusion sampling runs in fp32 by default (autocast disabled) for
+        # numerical stability — the EDM stepper's weighted_rigid_align SVD is
+        # always done in fp32 (see weighted_rigid_align), but with fp16 the
+        # denoiser network overflows and feeds NaN coords into that SVD. bf16 has
+        # fp32 range so it is stable and accurate. The diffusion precision follows
+        # cfg.amp; set cfg.amp_diffusion to override it (e.g. "fp32" to keep the
+        # denoiser fp32 while the trunk runs bf16). fp16 is NOT recommended.
+        amp = getattr(cfg, "amp_diffusion", None) or getattr(cfg, "amp", None)
+        amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp)
+        with torch.autocast(
+            "cuda", enabled=amp_dtype is not None, dtype=amp_dtype or torch.float16
+        ):
+            return self._sample_diffusion_impl(batch, out, cfg)
+
+    def _sample_diffusion_impl(self, batch, out, cfg):
 
         edm_sched_fn = get_edm_sched_fn(cfg.diffusion)
         sampler = Sampler(

@@ -4,7 +4,11 @@ recycling_steps: 4
 diffusion_samples: 5
 diffusion_steps: 200
 num_seeds: 1
+amp:          # mixed precision for the GPU forward passes: null (fp32) or bf16 (recommended on Hopper). fp16 overflows — avoid.
+amp_diffusion:  # override diffusion precision only (defaults to `amp`); set "fp32" to keep the denoiser fp32 while the trunk runs bf16
+pad_tokens_to_multiple:   # null/1 = pad to batch max. Set e.g. 32 to round the padded token count up to a multiple, so compile_score sees a stable shape and stops recompiling per size. Trades a little padding compute for far fewer recompiles; only useful with compile_score on a narrow size spread (e.g. binder design).
 skip_existing: true
+dynamic_schedule: false   # multi-rank scheduling: false => Lightning's static per-rank split (default); true => shared work queue (big jobs first, ranks pull more as they finish; requires task.make_batch_sampler)
 assert_msa: true
 save_traj: false
 save_distogram: false

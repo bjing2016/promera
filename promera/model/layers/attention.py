@@ -1,6 +1,7 @@
 # Adapted from https://github.com/jwohlwend/boltz
 from einops.layers.torch import Rearrange
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import initialize as init
@@ -117,16 +118,23 @@ class AttentionPairBias(nn.Module):
 
         g = self.proj_g(s).sigmoid()
 
-        with torch.autocast("cuda", enabled=False):
-            # Compute attention weights
-            attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
-            attn = attn / (self.head_dim**0.5) + z.float()
-            attn = attn + (1 - mask[:, None, None].float()) * -self.inf
-            attn = attn.softmax(dim=-1)
-
-            # Compute output
-            o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
-        o = o.reshape(B, -1, self.c_s)
+        # Fused scaled dot-product attention. The pair bias z and the key
+        # pad mask collapse into a single additive attention bias, and the
+        # whole attention runs in the ambient (autocast) dtype via a flash /
+        # memory-efficient kernel. The previous implementation pinned this
+        # core to fp32 (autocast disabled + q/k/v.float()), which left the
+        # dominant pairformer/diffusion attention on TF32 and added large
+        # cast-copy overhead, so enabling bf16 elsewhere gave little speedup.
+        # SDPA's default scale is 1/sqrt(head_dim), matching the old code.
+        # q/k/v: (B, L, H, D) -> (B, H, L, D)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        # z: (B, H, Lq, Lk) pair bias; mask: (B, Lk) key pad mask
+        attn_bias = z + (1 - mask[:, None, None].to(z.dtype)) * -self.inf
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        # (B, H, L, D) -> (B, L, H * D)
+        o = o.transpose(1, 2).reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
 
         return o

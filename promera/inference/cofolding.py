@@ -21,6 +21,20 @@ def _log(msg):
     print(f"[{time.strftime('%H:%M:%S')} rank{rank}] {msg}", flush=True)
 
 
+def _to_fp32(x):
+    """Recursively cast floating tensors in a dict/list tree back to fp32.
+
+    The trunk runs under autocast (fp16/bf16) when amp is set, so its outputs
+    must be promoted before the fp32 diffusion path consumes them (s/z/s_inputs)."""
+    if torch.is_tensor(x):
+        return x.float() if x.is_floating_point() else x
+    if isinstance(x, dict):
+        return {k: _to_fp32(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_to_fp32(v) for v in x]
+    return x
+
+
 class Cofolding:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -36,7 +50,53 @@ class Cofolding:
                     _log(f"Skipping {name} seed{seed_idx}")
                     continue
                 self.items.append((name, seed_idx))
+
+        # With batch_size > 1, items in a batch are padded to the batch's largest
+        # token/atom count, so mixing very different sizes wastes compute. Sorting
+        # items by size groups similar-sized targets into the same batch, which
+        # keeps the GPU efficiently saturated. We sort *descending* (largest
+        # first): under the dynamic scheduler this dispatches the longest jobs
+        # before the short ones (longest-processing-time greedy), so big targets
+        # don't become end-of-run stragglers while still being size-grouped.
+        # Order-only change (results are unaffected); opt out with
+        # sort_by_size=false.
+        if cfg.get("sort_by_size", True):
+            self.items.sort(key=lambda it: self._schema_size(it[0]), reverse=True)
+
         self._last_batch_end = None
+
+    def make_batch_sampler(self, world_size, rank, batch_size):
+        """Return a shared work-queue batch sampler (see schedule.py).
+
+        Opting into this (the default, via dynamic_schedule in the task config)
+        replaces Lightning's static DistributedSampler with dynamic claim-as-you-
+        finish scheduling across all ranks/nodes. The claim queue lives under the
+        output dir, keyed by the SLURM job id so concurrent jobs don't collide and
+        a re-run (new job id) starts a fresh queue. skip_existing still handles
+        already-finished targets, so the queue only ever covers this run's work."""
+        from .schedule import DynamicClaimBatchSampler
+
+        token = os.environ.get("SLURM_JOB_ID", "local")
+        claim_dir = os.path.join(self.cfg.output, f".promera_schedule_{token}")
+        return DynamicClaimBatchSampler(
+            len(self.items), batch_size, claim_dir, world_size, rank
+        )
+
+    def _schema_size(self, name):
+        """Cheap token-count estimate for a target (sum of polymer/ligand
+        sequence lengths from the schema JSON) used to group similar-sized
+        targets into the same batch."""
+        try:
+            with open(f"{self.cfg.input}/{name}.json") as f:
+                schema = json.loads(f.read())
+        except OSError:
+            return 0
+        total = 0
+        for key, val in schema.items():
+            if key == "connections" or not isinstance(val, dict):
+                continue
+            total += len(val.get("sequence", ""))
+        return total
 
     def __len__(self):
         return len(self.items)
@@ -77,50 +137,85 @@ class Cofolding:
         return finalize_feats(feats, struct, name, seed_idx)
 
     def run_batch(self, model, batch):
+        import contextlib
 
         cfg = self.cfg
         savedir = cfg.output
         mul = self.cfg.diffusion_samples
 
-        name = batch["name"][0]
-        seed_idx = batch["seed_idx"][0]
-
-        n_chains = len(batch["struct"][0].chains)
-        n_tokens = int(batch["token_pad_mask"][0].sum())
-        n_atoms = int(batch["atom_pad_mask"][0].sum())
-        _log(
-            f"Running {name} seed{seed_idx}: "
-            f"{n_chains} chains, {n_tokens} tokens, {n_atoms} atoms"
+        # Optional mixed precision (cfg.amp = "fp16"/"bf16"). The trunk
+        # (pairformer) dominates wall-clock on larger targets, so autocasting it
+        # — plus confidence/contact — is the main throughput lever on Hopper.
+        # Diffusion picks up the same setting via cfg.amp inside sample_diffusion.
+        amp = cfg.get("amp", None)
+        amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp)
+        amp_ctx = (
+            torch.autocast("cuda", dtype=amp_dtype)
+            if amp_dtype is not None
+            else contextlib.nullcontext()
         )
+
+        # batch_size may be > 1: every batch element is an independent target.
+        # The model forward (pairformer / diffusion / confidence / contact) is
+        # fully batched over B; the per-element bookkeeping (struct, name, seed,
+        # output paths) is resolved in the write loop via b = n // mul.
+        B = len(batch["name"])
+
+        for b in range(B):
+            n_chains = len(batch["struct"][b].chains)
+            n_tokens = int(batch["token_pad_mask"][b].sum())
+            n_atoms = int(batch["atom_pad_mask"][b].sum())
+            _log(
+                f"Running {batch['name'][b]} seed{batch['seed_idx'][b]}: "
+                f"{n_chains} chains, {n_tokens} tokens, {n_atoms} atoms"
+            )
 
         t0 = time.time()
         try:
-            out = model.pairformer_forward(batch, recycling_steps=cfg.recycling_steps)
+            with amp_ctx:
+                out = model.pairformer_forward(
+                    batch, recycling_steps=cfg.recycling_steps
+                )
+            # Promote trunk outputs to fp32 for the fp32 diffusion path; the
+            # confidence/contact passes re-autocast from these fp32 inputs.
+            if amp_dtype is not None:
+                out = _to_fp32(out)
             t1 = time.time()
 
-            os.makedirs(f"{savedir}/{name}", exist_ok=True)
             if cfg.save_distogram:
-                np.save(
-                    f"{savedir}/{name}/{name}_seed{seed_idx}_distogram.npy",
-                    out["pdistogram"][-1].softmax(-1).cpu().numpy(),
-                )
+                pdist = out["pdistogram"][-1].softmax(-1).cpu().numpy()
+                for b in range(B):
+                    name = batch["name"][b]
+                    seed_idx = batch["seed_idx"][b]
+                    ntoks_b = int(batch["token_pad_mask"][b].sum())
+                    os.makedirs(f"{savedir}/{name}", exist_ok=True)
+                    np.save(
+                        f"{savedir}/{name}/{name}_seed{seed_idx}_distogram.npy",
+                        pdist[b, :ntoks_b, :ntoks_b],
+                    )
 
             diffusion_out = model.sample_diffusion(batch, out, cfg)
             t2 = time.time()
 
-            all_samples = diffusion_out["sample_atom_coords"].cpu().numpy()
-            all_traj = diffusion_out["sample_noisy"].cpu().numpy()
-            struct = batch["struct"][0]
+            all_samples = diffusion_out["sample_atom_coords"].float().cpu().numpy()
+            all_traj = diffusion_out["sample_noisy"].float().cpu().numpy()
 
             coords = diffusion_out["sample_atom_coords"]
             if model.cfg.model.has_confidence:
                 confidences = []
                 for i in range(mul):
-                    conf = model.sm_confidence_module(
-                        batch,
-                        out | {"sample_atom_coords": coords[i::mul]},
-                        multiplicity=1,
-                    )
+                    with amp_ctx:
+                        conf = model.sm_confidence_module(
+                            batch,
+                            out | {"sample_atom_coords": coords[i::mul]},
+                            multiplicity=1,
+                        )
+                    # Cast metric tensors back to fp32 so the aggregate
+                    # confidence math is precision-independent under amp.
+                    conf = {
+                        k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v)
+                        for k, v in conf.items()
+                    }
                     conf["pae_logits"] = conf["pae_logits"].cpu()
                     conf["pde_logits"] = conf["pde_logits"].cpu()
                     torch.cuda.empty_cache()
@@ -132,13 +227,16 @@ class Cofolding:
             if getattr(model.cfg.model, "has_contact_module", False):
                 contact_outs = []
                 for i in range(mul):
-                    contact_out = model.contact_module(
-                        batch,
-                        out | {"sample_atom_coords": coords[i::mul]},
-                        multiplicity=1,
+                    with amp_ctx:
+                        contact_out = model.contact_module(
+                            batch,
+                            out | {"sample_atom_coords": coords[i::mul]},
+                            multiplicity=1,
+                        )
+                    contact_out["contact_logits"] = (
+                        contact_out["contact_logits"].float().cpu()
                     )
-                    contact_out["contact_logits"] = contact_out["contact_logits"].cpu()
-                    contact_out["pred_dist"] = contact_out["pred_dist"].cpu()
+                    contact_out["pred_dist"] = contact_out["pred_dist"].float().cpu()
                     torch.cuda.empty_cache()
                     contact_outs.append(contact_out)
                 t4 = time.time()
@@ -147,7 +245,8 @@ class Cofolding:
 
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            _log(f"OOM for {name} seed{seed_idx}, skipping")
+            names = ", ".join(str(batch["name"][b]) for b in range(B))
+            _log(f"OOM for batch [{names}], skipping")
             return
 
         def copy_sample_to_struct(struct, samp):
@@ -162,25 +261,32 @@ class Cofolding:
 
         t_last_gpu = t4
         t_io_start = time.time()
+        # all_samples is laid out [B * mul] as b * mul + s (repeat_interleave),
+        # so b = n // mul selects the target and s = n % mul the sample index.
         for n, samp in enumerate(all_samples):
+            b = n // mul
+            s = n % mul
+            struct = batch["struct"][b]
+            name = batch["name"][b]
+            seed_idx = batch["seed_idx"][b]
+            ntoks = int(batch["token_pad_mask"][b].sum())
+
+            os.makedirs(f"{savedir}/{name}", exist_ok=True)
             copy_sample_to_struct(struct, samp)
             struct.to_mmcif(
-                f"{savedir}/{name}/{name}_seed{seed_idx}_samp{n}.cif", metadata=True
+                f"{savedir}/{name}/{name}_seed{seed_idx}_samp{s}.cif", metadata=True
             )
 
             conf_data = {}
 
             if model.cfg.model.has_confidence:
-                confidence = confidences[n % mul]
-                ntoks = int(batch["token_pad_mask"][n // mul].sum())
-                pde = confidence["pde"][n // mul, :ntoks, :ntoks]
-                pae = confidence["pae"][n // mul, :ntoks, :ntoks]
-                plddt = confidence["plddt"][n // mul, :ntoks]
-                pae_logits = confidence["pae_logits"][n // mul, :ntoks, :ntoks].to(
-                    pae.device
-                )
-                frame_mask = batch["frames_mask"][n // mul, :ntoks]
-                asym_id = batch["asym_id_"][n // mul]
+                confidence = confidences[s]
+                pde = confidence["pde"][b, :ntoks, :ntoks]
+                pae = confidence["pae"][b, :ntoks, :ntoks]
+                plddt = confidence["plddt"][b, :ntoks]
+                pae_logits = confidence["pae_logits"][b, :ntoks, :ntoks].to(pae.device)
+                frame_mask = batch["frames_mask"][b, :ntoks]
+                asym_id = batch["asym_id_"][b]
 
                 agg_conf = compute_agg_confidence(
                     pde=pde,
@@ -195,7 +301,7 @@ class Cofolding:
 
                 if cfg.save_full_confidence:
                     np.savez(
-                        f"{savedir}/{name}/{name}_seed{seed_idx}_samp{n}_conf.npz",
+                        f"{savedir}/{name}/{name}_seed{seed_idx}_samp{s}_conf.npz",
                         pde=pde.cpu().numpy(),
                         pae=pae.cpu().numpy(),
                         plddt=plddt.cpu().numpy(),
@@ -204,24 +310,23 @@ class Cofolding:
                     )
 
             if getattr(model.cfg.model, "has_contact_module", False):
-                contact_out = contact_outs[n % mul]
-                ntoks_n = int(batch["token_pad_mask"][n // mul].sum())
+                contact_out = contact_outs[s]
                 conf_data["iCS"] = compute_contact_stats(
-                    contact_out["contact_logits"][n // mul, :ntoks_n, :ntoks_n],
-                    contact_out["pred_dist"][n // mul, :ntoks_n, :ntoks_n],
-                    batch["asym_id_"][n // mul][:ntoks_n],
+                    contact_out["contact_logits"][b, :ntoks, :ntoks],
+                    contact_out["pred_dist"][b, :ntoks, :ntoks],
+                    batch["asym_id_"][b][:ntoks],
                 )
 
             if conf_data:
                 conf_data.update(struct.msa_summary)
                 with open(
-                    f"{savedir}/{name}/{name}_seed{seed_idx}_samp{n}_conf.json", "w"
+                    f"{savedir}/{name}/{name}_seed{seed_idx}_samp{s}_conf.json", "w"
                 ) as f:
                     f.write(json.dumps(conf_data, indent=4))
 
         t_io_end = time.time()
         _log(
-            f"Done {name} seed{seed_idx}: "
+            f"Done batch ({B} target(s)): "
             f"pairformer={t1-t0:.1f}s  diffusion={t2-t1:.1f}s  "
             f"confidence={t3-t2:.1f}s  contact={t4-t3:.1f}s  "
             f"write={t_io_end-t_io_start:.1f}s  total={t_io_end-t0:.1f}s"
@@ -231,6 +336,11 @@ class Cofolding:
         if cfg.save_traj:
             steps = np.arange(0, all_traj.shape[1], 10)
             for n, traj in enumerate(all_traj):
+                b = n // mul
+                s = n % mul
+                struct = batch["struct"][b]
+                name = batch["name"][b]
+                seed_idx = batch["seed_idx"][b]
                 i = 0
                 for key, chain in struct.chains.items():
                     chain._models = np.zeros((len(steps), *chain.coords.shape))
@@ -240,7 +350,7 @@ class Cofolding:
                                 chain._models[:, j, k] = traj[steps, i]
                                 i += 1
                 struct.to_mmcif(
-                    f"{savedir}/{name}/{name}_seed{seed_idx}_samp{n}_traj.cif",
+                    f"{savedir}/{name}/{name}_seed{seed_idx}_samp{s}_traj.cif",
                     models=[
                         {k: struct.chains[k]._models[i] for k in struct.chains}
                         for i, _ in enumerate(steps)

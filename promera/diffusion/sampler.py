@@ -97,12 +97,22 @@ class EDMDiffusionStepper:
             # boltz alignment
             from ..model.loss.diffusion import weighted_rigid_align
 
+            # coords carry the multiplicity-expanded batch (B * diffusion_samples)
+            # while atom_pad_mask is still the un-expanded batch (B). Repeat it to
+            # match so the per-sample alignment broadcasts correctly for B > 1
+            # (at B == 1 the mask broadcast happened to work already).
+            atom_mask = batch["atom_pad_mask"].float()
+            if atom_mask.shape[0] != x.shape[0]:
+                atom_mask = atom_mask.repeat_interleave(
+                    x.shape[0] // atom_mask.shape[0], 0
+                )
+
             with torch.autocast("cuda", enabled=False):
                 x = weighted_rigid_align(
                     x.float(),
                     x0.float(),
-                    batch["atom_pad_mask"].float(),
-                    batch["atom_pad_mask"].float(),
+                    atom_mask,
+                    atom_mask,
                 )
             t_hat = batch["coords_sigma"]
             delta = (x0 - x) / t_hat[..., None, None]

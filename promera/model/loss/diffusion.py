@@ -61,8 +61,12 @@ def weighted_rigid_align(
     # Compute the SVD of the covariance matrix, required float32 for svd and determinant
     original_dtype = cov_matrix.dtype
     cov_matrix_32 = cov_matrix.to(dtype=torch.float32)
+    # gesvdj (batched Jacobi) is dramatically faster than gesvd for the batch of
+    # tiny 3x3 covariance matrices here and stays on-GPU (gesvd has ~35ms/call of
+    # host-side work that serialises every diffusion step). The rotation it yields
+    # is numerically equivalent for 3x3.
     U, S, V = torch.linalg.svd(
-        cov_matrix_32, driver="gesvd" if cov_matrix_32.is_cuda else None
+        cov_matrix_32, driver="gesvdj" if cov_matrix_32.is_cuda else None
     )
     V = V.mH
 

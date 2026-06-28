@@ -77,10 +77,10 @@ De novo binder design is built into Promera via the `promera.inference.Design` t
 
 ### Setup: LigandMPNN
 
-Sequence redesign after backbone diffusion requires [LigandMPNN](https://github.com/dauparas/LigandMPNN).
+Sequence redesign after backbone diffusion requires LigandMPNN. Use the promera-compatible fork [`bjing2016/LigandMPNN`](https://github.com/bjing2016/LigandMPNN), which adds an in-memory, GPU-batched redesign entrypoint (`design_batched`) and caches the loaded model across calls — the design loop scores every backbone in a batch in one pass, with no per-backbone PDB round-trip or checkpoint reload.
 
 ```bash
-git clone https://github.com/dauparas/LigandMPNN ../LigandMPNN
+git clone https://github.com/bjing2016/LigandMPNN ../LigandMPNN
 cd ../LigandMPNN && bash get_model_params.sh ./model_params
 export LIGANDMPNN_DIR=$(pwd)
 ```
@@ -133,6 +133,28 @@ python -m promera \
 ```
 
 Copy and edit [`examples/design_minibinder.yaml`](examples/design_minibinder.yaml) or [`examples/design_vhh.yaml`](examples/design_vhh.yaml) for your design setting.
+
+---
+
+## Optimizing performance
+
+Defaults are conservative (fp32, one target at a time). These knobs are opt-in and preserve the prediction (bf16 stays within the run-to-run diffusion-sample spread). Recommended, in priority order:
+
+```bash
+python -m promera input=schemas/ output=out/ \
+    batch_size=16 amp=bf16 \
+    model.structure_module_args.compile_score=true \
+    pad_tokens_to_multiple=32 \
+    meta_init=true
+```
+
+- **`batch_size=N`** — fold/design N items per forward pass; the main utilization lever. Items pad to the batch's largest size, so `sort_by_size=true` (default) groups similar sizes; an out-of-memory batch is skipped with a warning. Results are independent of `batch_size` up to normal nondeterminism.
+- **`amp=bf16`** — bf16 forward passes, the single biggest lever (`amp_diffusion` overrides diffusion only). **fp16 overflows — avoid it.** Use this flag, not Lightning's `precision=bf16-mixed`, which collides with the diffusion sampler and crashes.
+- **`compile_score=true`** — compiles the diffusion token transformer. Keyed on shape, so pair with **`pad_tokens_to_multiple=32`** to share one compiled shape across a size spread; set `TORCHINDUCTOR_CACHE_DIR` to reuse across runs.
+- **`cudagraph_score`** *(not recommended)* — only helps `batch_size=1`; prefer raising `batch_size`.
+- **`meta_init=true`** — loads weights straight from the checkpoint (fastest startup); requires a complete checkpoint, so keep `false` for training.
+
+For **design**, `batch_size` + `amp=bf16` is the recommendation: backbone generation, inverse folding (one in-memory LigandMPNN pass with a cached model, no PDB round-trip), and refold all batch across the backbones. `compile_score`/`cudagraph_score` aren't worth it, and a large fraction of each design is CPU-bound metrics regardless.
 
 ---
 
